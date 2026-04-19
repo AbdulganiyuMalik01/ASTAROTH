@@ -1,0 +1,4 @@
+[deploy]
+startCommand = "python token_tracker_polling.py"
+healthcheckPath = "/health"
+healthcheckTimeout = 30
