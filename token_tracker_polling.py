@@ -2111,6 +2111,9 @@ async def run_detections(token: TokenInfo, session: aiohttp.ClientSession = None
             or token.ws_discovered  # WS tokens don't have poll history, use other gates
         )
 
+        # Gate 4: Suppression — don't re-alert a suppressed token
+        not_suppressed = time.time() > token.alert_suppressed_until
+
         # ── Fast velocity path: bypass age_min for rockets ───────────────
         # Token is pumping so fast the normal age window is too slow
         fast_velocity = (
@@ -2134,9 +2137,6 @@ async def run_detections(token: TokenInfo, session: aiohttp.ClientSession = None
             and token.buys_h1 >= max(min_buys_h1 // 2, 10)
             and price_not_crashing and mc_not_collapsed and not_suppressed
         )
-
-        # Gate 4: Suppression — don't re-alert a suppressed token
-        not_suppressed = time.time() > token.alert_suppressed_until
 
         # ── Standard path ────────────────────────────────────────────────
         standard = (age_ok and mc_ok and vol_ok and liq_ok and buy_ratio_ok and min_buys_ok
