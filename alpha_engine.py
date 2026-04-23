@@ -65,27 +65,27 @@ logger = logging.getLogger(__name__)
 # ─────────────────────────────────────────────────────────────────────────────
 
 # ── Alert thresholds ──────────────────────────────────────────────────────────
-ALPHA_SCORE_WATCH         = float(os.getenv("ALPHA_SCORE_WATCH",         "65.0"))
-ALPHA_SCORE_THRESHOLD     = float(os.getenv("ALPHA_SCORE_THRESHOLD",     "72.0"))
-ALPHA_CONFIRMATIONS       = int(os.getenv("ALPHA_CONFIRMATIONS",         "2"))
-ALPHA_CONFIRM_GAP_S       = int(os.getenv("ALPHA_CONFIRM_GAP_S",         "300"))
-ALPHA_COOLDOWN_SECONDS    = int(os.getenv("ALPHA_COOLDOWN_SECONDS",      "1800"))
-ALPHA_GLOBAL_CAP_PER_MIN  = int(os.getenv("ALPHA_GLOBAL_CAP_PER_MIN",   "6"))
-ALPHA_POLL_INTERVAL       = int(os.getenv("ALPHA_POLL_INTERVAL",         "60"))
+ALPHA_SCORE_WATCH         = float(os.getenv("ALPHA_SCORE_WATCH",         "45.0"))
+ALPHA_SCORE_THRESHOLD     = float(os.getenv("ALPHA_SCORE_THRESHOLD",     "55.0"))
+ALPHA_CONFIRMATIONS       = int(os.getenv("ALPHA_CONFIRMATIONS",         "1"))
+ALPHA_CONFIRM_GAP_S       = int(os.getenv("ALPHA_CONFIRM_GAP_S",         "120"))
+ALPHA_COOLDOWN_SECONDS    = int(os.getenv("ALPHA_COOLDOWN_SECONDS",      "900"))
+ALPHA_GLOBAL_CAP_PER_MIN  = int(os.getenv("ALPHA_GLOBAL_CAP_PER_MIN",   "20"))
+ALPHA_POLL_INTERVAL       = int(os.getenv("ALPHA_POLL_INTERVAL",         "30"))
 ALPHA_MAX_TOKEN_AGE_H     = float(os.getenv("ALPHA_MAX_TOKEN_AGE_H",     "48.0"))
-ALPHA_MIN_TOKEN_AGE_S     = int(os.getenv("ALPHA_MIN_TOKEN_AGE_S",       "600"))
+ALPHA_MIN_TOKEN_AGE_S     = int(os.getenv("ALPHA_MIN_TOKEN_AGE_S",       "60"))
 SOL_PRICE_USD             = float(os.getenv("SOL_PRICE_USD",             "175.0"))
 
 # ── Hard gate constants (now used as band centres; violations = penalties) ────
-SMART_BUY_VOL_1H_MIN_USD  = float(os.getenv("SMART_BUY_VOL_1H_MIN_USD",  "20000"))
-SMART_BUY_VOL_1H_MAX_USD  = float(os.getenv("SMART_BUY_VOL_1H_MAX_USD",  "50000"))
-SMART_MC_MIN_USD          = float(os.getenv("SMART_MC_MIN_USD",           "30000"))
-SMART_MC_MAX_USD          = float(os.getenv("SMART_MC_MAX_USD",           "400000"))
-SMART_MIN_BUY_TX_1H       = int(os.getenv("SMART_MIN_BUY_TX_1H",         "40"))
-SMART_MIN_BUY_RATIO       = float(os.getenv("SMART_MIN_BUY_RATIO",        "0.55"))
-SMART_MIN_LIQUIDITY_USD   = float(os.getenv("SMART_MIN_LIQUIDITY_USD",    "12000"))
-SMART_MIN_LIQ_MC_RATIO    = float(os.getenv("SMART_MIN_LIQ_MC_RATIO",    "0.07"))
-SMART_MIN_ACCEL           = float(os.getenv("SMART_MIN_ACCEL",            "0.20"))
+SMART_BUY_VOL_1H_MIN_USD  = float(os.getenv("SMART_BUY_VOL_1H_MIN_USD",  "3000"))
+SMART_BUY_VOL_1H_MAX_USD  = float(os.getenv("SMART_BUY_VOL_1H_MAX_USD",  "500000"))
+SMART_MC_MIN_USD          = float(os.getenv("SMART_MC_MIN_USD",           "10000"))
+SMART_MC_MAX_USD          = float(os.getenv("SMART_MC_MAX_USD",           "2000000"))
+SMART_MIN_BUY_TX_1H       = int(os.getenv("SMART_MIN_BUY_TX_1H",         "10"))
+SMART_MIN_BUY_RATIO       = float(os.getenv("SMART_MIN_BUY_RATIO",        "0.50"))
+SMART_MIN_LIQUIDITY_USD   = float(os.getenv("SMART_MIN_LIQUIDITY_USD",    "5000"))
+SMART_MIN_LIQ_MC_RATIO    = float(os.getenv("SMART_MIN_LIQ_MC_RATIO",    "0.03"))
+SMART_MIN_ACCEL           = float(os.getenv("SMART_MIN_ACCEL",            "0.05"))
 ALPHA_MIN_LIQUIDITY_USD   = SMART_MIN_LIQUIDITY_USD  # alias
 
 # ── Soft-gate penalty multipliers (#1) ───────────────────────────────────────
@@ -226,7 +226,7 @@ def score_token(token: AlphaToken, now: Optional[float] = None) -> Tuple[float, 
     """
     now = now or time.time()
     bd: dict = {}
-    penalty = 1.0          # cumulative soft-gate multiplier
+    penalties: list = []   # collect individual penalty factors — use worst-one-wins, NOT stacked
     violations: list = []  # human-readable gate violations
 
     # ── Stage 1: Absolute hard gates (zero-score on violation) ───────────────
@@ -239,77 +239,83 @@ def score_token(token: AlphaToken, now: Optional[float] = None) -> Tuple[float, 
         bd["rejected"] = f"too_old ({age_s/3600:.1f}h > {ALPHA_MAX_TOKEN_AGE_H}h)"
         return 0.0, bd
 
-    if not token.dex_confirmed or token.launchpad == "Unknown":
-        bd["rejected"] = f"unconfirmed_dex (lp={token.launchpad})"
-        return 0.0, bd
+    # dex_confirmed is now a soft penalty, not a hard gate — catches tokens before DexScreener confirms
+    if not token.dex_confirmed:
+        violations.append("unconfirmed_dex")
+        penalties.append(0.70)
 
     mc = token.market_cap_usd
     if mc <= 0:
         bd["rejected"] = "mc_zero"
         return 0.0, bd
 
-    v1h = token.buy_vol_usd_1h
+    # Use total vol if directional buy vol unavailable
+    v1h = token.buy_vol_usd_1h if token.buy_vol_usd_1h > 0 else token.vol_usd_1h * 0.6
     if v1h <= 0:
-        bd["rejected"] = "buy_vol_1h_missing"
+        bd["rejected"] = "vol_1h_missing"
         return 0.0, bd
 
     liq = token.liquidity_usd
     if liq <= 0:
-        bd["rejected"] = "liq_zero"
-        return 0.0, bd
+        # Soft-penalise missing liq instead of hard reject — DexScreener often lags
+        violations.append("liq_unconfirmed")
+        penalties.append(0.60)
+        liq = mc * 0.05  # estimate 5% liq/MC as fallback
 
-    # ── Stage 2: Soft gates — apply penalty multipliers (#1) ─────────────────
+    # ── Stage 2: Soft gates — worst-penalty-wins (NO stacking) (#1 fixed) ───────
+    # CRITICAL FIX: penalties are collected and only the single worst one is applied.
+    # Stacking (0.60×0.55×0.50×...) was crushing scores to ~6% — nothing passed 55.
 
     # MC band check
     if mc < SMART_MC_MIN_USD:
         violations.append(f"mc_low(${mc:,.0f}<${SMART_MC_MIN_USD:,.0f})")
-        penalty *= MC_PENALTY_FACTOR
+        penalties.append(MC_PENALTY_FACTOR)
     elif mc > SMART_MC_MAX_USD:
         violations.append(f"mc_high(${mc:,.0f}>${SMART_MC_MAX_USD:,.0f})")
-        penalty *= MC_PENALTY_FACTOR
+        penalties.append(MC_PENALTY_FACTOR)
 
     # Vol 1h band check
     if v1h < SMART_BUY_VOL_1H_MIN_USD:
         violations.append(f"vol_low(${v1h:,.0f}<${SMART_BUY_VOL_1H_MIN_USD:,.0f})")
-        penalty *= VOL_PENALTY_FACTOR
+        penalties.append(VOL_PENALTY_FACTOR)
     elif v1h > SMART_BUY_VOL_1H_MAX_USD:
         violations.append(f"vol_high(${v1h:,.0f}>${SMART_BUY_VOL_1H_MAX_USD:,.0f})")
-        penalty *= VOL_PENALTY_FACTOR
+        penalties.append(VOL_PENALTY_FACTOR)
 
     # Liquidity floor
     if liq < SMART_MIN_LIQUIDITY_USD:
         violations.append(f"liq_low(${liq:,.0f}<${SMART_MIN_LIQUIDITY_USD:,.0f})")
-        penalty *= LIQ_PENALTY_FACTOR
+        penalties.append(LIQ_PENALTY_FACTOR)
     elif mc > 0 and (liq / mc) < SMART_MIN_LIQ_MC_RATIO:
         violations.append(f"liq_mc_ratio_low({liq/mc:.3f}<{SMART_MIN_LIQ_MC_RATIO})")
-        penalty *= LIQ_PENALTY_FACTOR
+        penalties.append(LIQ_PENALTY_FACTOR)
 
     # Buy/sell ratio
     total_txns = token.txns_5m_buys + token.txns_5m_sells
-    buy_ratio  = (token.txns_5m_buys / total_txns) if total_txns > 0 else 0.5
+    buy_ratio  = (token.txns_5m_buys / total_txns) if total_txns > 0 else 0.55
     if buy_ratio < SMART_MIN_BUY_RATIO:
         violations.append(f"sell_pressure(buy_ratio={buy_ratio:.2f}<{SMART_MIN_BUY_RATIO})")
-        penalty *= BUY_RATIO_PENALTY
+        penalties.append(BUY_RATIO_PENALTY)
 
     # Minimum 1h buy transactions
     buy_tx_1h = token.txns_1h_buys if token.txns_1h_buys > 0 else token.txns_5m_buys * 12
     if buy_tx_1h < SMART_MIN_BUY_TX_1H:
         violations.append(f"low_buy_tx({buy_tx_1h}<{SMART_MIN_BUY_TX_1H})")
-        penalty *= TX_COUNT_PENALTY
+        penalties.append(TX_COUNT_PENALTY)
 
     # Vol acceleration
-    v5m = token.buy_vol_usd_5m
+    v5m = token.buy_vol_usd_5m if token.buy_vol_usd_5m > 0 else token.vol_usd_5m * 0.6
     expected_5m = v1h / 12.0
     accel = (v5m / expected_5m) if expected_5m > 0 else 0.0
     if accel < SMART_MIN_ACCEL:
         violations.append(f"no_accel(accel={accel:.2f}<{SMART_MIN_ACCEL})")
-        penalty *= ACCEL_PENALTY
+        penalties.append(ACCEL_PENALTY)
 
-    # If penalty is catastrophically low after stacking, still surface in logs
-    if penalty < 0.10:
-        bd["soft_gate_warn"] = f"heavy_penalties ({penalty:.3f}x): {'; '.join(violations)}"
-    elif violations:
-        bd["soft_gate_penalties"] = f"{penalty:.3f}x: {'; '.join(violations)}"
+    # Apply only the single worst penalty (not all stacked)
+    penalty = min(penalties) if penalties else 1.0
+
+    if violations:
+        bd["soft_gate_penalties"] = f"worst={penalty:.3f}x ({len(violations)} violations): {'; '.join(violations)}"
 
     # ── Stage 3: Normalised quality score (0-100) ──────────────────────────────
 

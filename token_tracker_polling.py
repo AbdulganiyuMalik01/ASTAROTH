@@ -155,44 +155,44 @@ CHAINS: Dict[str, dict] = {
 # Each chain has different token lifecycle, MC ranges, and trading behaviour
 CHAIN_THRESHOLDS = {
     "solana": {
-        "age_min":      15 * 60,     # 15 min  — fast launch cycle
-        "age_max":      90 * 60,     # 90 min  — dies quickly
-        "mc_min":       30_000,
-        "mc_max":       400_000,
-        "vol_mc_ratio": 0.50,        # high vol relative to MC (pump.fun style)
-        "liq_min":      10_000,
-        "buy_ratio_min": 0.60,
-        "min_buys_h1":  30,
+        "age_min":      3 * 60,      # 3 min — catch runners at launch
+        "age_max":      6 * 3600,    # 6 hours — runners can sustain
+        "mc_min":       10_000,      # catch early before MC pumps
+        "mc_max":       2_000_000,   # don't miss mid-cap runners
+        "vol_mc_ratio": 0.15,        # lowered — early tokens have less vol
+        "liq_min":      5_000,       # young tokens have less liq
+        "buy_ratio_min": 0.52,
+        "min_buys_h1":  10,
     },
     "bsc": {
-        "age_min":      5 * 60,      # 5 min  — BSC launches fast
-        "age_max":      6 * 3600,    # 6 hours — some BSC runners sustain longer
-        "mc_min":       15_000,
-        "mc_max":       3_000_000,   # BSC gems can be larger
-        "vol_mc_ratio": 0.15,        # BSC can have lower vol/MC early
-        "liq_min":      12_000,      # reasonable floor
-        "buy_ratio_min": 0.55,
-        "min_buys_h1":  12,
+        "age_min":      2 * 60,      # 2 min — BSC launches very fast
+        "age_max":      12 * 3600,   # 12 hours — BSC runners sustain longer
+        "mc_min":       8_000,
+        "mc_max":       5_000_000,
+        "vol_mc_ratio": 0.08,
+        "liq_min":      5_000,
+        "buy_ratio_min": 0.52,
+        "min_buys_h1":  8,
     },
     "base": {
-        "age_min":      10 * 60,
-        "age_max":      3 * 3600,    # 3 hours
-        "mc_min":       20_000,
-        "mc_max":       1_000_000,
-        "vol_mc_ratio": 0.25,
-        "liq_min":      15_000,
-        "buy_ratio_min": 0.55,
-        "min_buys_h1":  15,
+        "age_min":      3 * 60,
+        "age_max":      6 * 3600,
+        "mc_min":       10_000,
+        "mc_max":       3_000_000,
+        "vol_mc_ratio": 0.10,
+        "liq_min":      5_000,
+        "buy_ratio_min": 0.52,
+        "min_buys_h1":  8,
     },
     "ethereum": {
-        "age_min":      5 * 60,      # 5 min — catch ETH runners early
-        "age_max":      12 * 3600,   # 12 hours — ETH runners can sustain for half a day
-        "mc_min":       30_000,      # target floor: $30k
-        "mc_max":       60_000,      # target ceiling: $60k — sweet spot for runners
-        "vol_mc_ratio": 0.10,        # ETH trades slowly — 10% vol/MC is meaningful
-        "liq_min":      10_000,      # lower liq floor to match small MC target
-        "buy_ratio_min": 0.55,
-        "min_buys_h1":  5,           # small MC = fewer txns, lower the bar
+        "age_min":      2 * 60,      # 2 min — catch ETH runners at the start
+        "age_max":      24 * 3600,   # 24 hours — ETH runners sustain much longer
+        "mc_min":       15_000,
+        "mc_max":       500_000,     # widened — don't miss ETH mid-caps
+        "vol_mc_ratio": 0.05,        # ETH trades slowly — 5% is meaningful signal
+        "liq_min":      5_000,
+        "buy_ratio_min": 0.52,
+        "min_buys_h1":  3,           # ETH has fewer txns on small caps
     },
 }
 
@@ -223,21 +223,21 @@ POLL_INTERVAL = 15            # [v4.5] Reduced — WS handles discovery now
 TOKENS_PER_POLL = 30
 
 # Gem detection thresholds
-GEM_AGE_MIN = 15 * 60
-GEM_AGE_MAX = 90 * 60
-GEM_MC_MIN = 30_000
-GEM_MC_MAX = 400_000
-GEM_VOL_MC_RATIO = 0.5
-GEM_LIQUIDITY_MIN = 10_000
-GEM_COOLDOWN = 600
+GEM_AGE_MIN = 3 * 60           # 3 min — catch tokens as early as possible
+GEM_AGE_MAX = 6 * 3600         # 6 hours — runners can sustain longer than 90 min
+GEM_MC_MIN = 10_000            # lower floor — catch early before MC pumps
+GEM_MC_MAX = 2_000_000         # raised ceiling — don't miss mid-cap runners
+GEM_VOL_MC_RATIO = 0.15        # lowered — early tokens have lower vol/MC
+GEM_LIQUIDITY_MIN = 5_000      # lowered — young tokens have less liq
+GEM_COOLDOWN = 300             # 5 min cooldown (was 10) — faster re-alert on runners
 
 # [v4.8] Buy pressure thresholds
-GEM_BUY_RATIO_MIN = 0.60       # ≥60% of txns must be buys (blocks dumps)
-GEM_MIN_BUYS_H1 = 30           # [fix] lowered: 30 real buys in 1h to block wash trading
-GEM_WS_BUY_PRESSURE = 1.5     # live ws buys/sells ratio for early alert
-GEM_FAST_VELOCITY = 50.0       # MC velocity % to bypass age_min gate
-GEM_FAST_MC_MIN = 20_000       # lower MC floor for fast-velocity alert path
-GEM_VOL_ACCEL_MC_MAX = 200_000 # MC ceiling for vol-acceleration early trigger
+GEM_BUY_RATIO_MIN = 0.52       # lowered from 0.60 — less strict buy dominance required
+GEM_MIN_BUYS_H1 = 10           # lowered from 30 — catch early momentum
+GEM_WS_BUY_PRESSURE = 1.2     # lowered — alert sooner on buy pressure
+GEM_FAST_VELOCITY = 15.0       # lowered from 50% — easier to trigger fast-velocity path
+GEM_FAST_MC_MIN = 8_000        # lower MC floor for fast-velocity alert path
+GEM_VOL_ACCEL_MC_MAX = 500_000 # raised ceiling for vol-acceleration trigger
 
 MULTIPLIER_MILESTONES = [2.0, 3.0, 5.0, 10.0]
 
