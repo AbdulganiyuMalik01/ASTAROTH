@@ -367,23 +367,35 @@ async def log_alert_performance(
     liq_at_alert: float,
     launchpad: str = "Unknown",
     chain: str = "solana",
+    alert_message_id: int = 0,  # Telegram message_id for reply-threading
 ) -> int:
     """
     Record a new alert for performance tracking.
 
     Returns the row ID so the caller can reference it for snapshot updates.
     Call this immediately when an alert fires, right after send_telegram_message().
+    alert_message_id: the Telegram message_id returned by send_message(), used to
+                      reply-thread the 30m/1h/4h snapshot cards.
     """
     async with aiosqlite.connect(DB_NAME) as db:
+        # Ensure column exists (safe to run every time — only adds if missing)
+        try:
+            await db.execute(
+                "ALTER TABLE alert_performance ADD COLUMN alert_message_id INTEGER DEFAULT 0"
+            )
+            await db.commit()
+        except Exception:
+            pass  # column already exists
+
         cursor = await db.execute(
             """INSERT INTO alert_performance
                (mint, alert_type, alerted_at, score,
                 price_at_alert, mc_at_alert, liq_at_alert,
-                launchpad, chain)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                launchpad, chain, alert_message_id)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
             (mint, alert_type, time.time(), score,
              price_at_alert, mc_at_alert, liq_at_alert,
-             launchpad, chain)
+             launchpad, chain, alert_message_id)
         )
         await db.commit()
         return cursor.lastrowid
@@ -446,7 +458,8 @@ async def get_pending_performance_snapshots() -> List[Dict]:
         async with db.execute(
             """SELECT id, mint, alerted_at,
                       price_at_alert,
-                      snapshot_30m_at, snapshot_1h_at, snapshot_4h_at
+                      snapshot_30m_at, snapshot_1h_at, snapshot_4h_at,
+                      COALESCE(alert_message_id, 0) as alert_message_id
                FROM alert_performance
                WHERE alerted_at > ?        -- only within last 5h (4h window + buffer)
                  AND (
@@ -460,13 +473,14 @@ async def get_pending_performance_snapshots() -> List[Dict]:
         ) as cursor:
             for r in await cursor.fetchall():
                 rows.append({
-                    "id":             r[0],
-                    "mint":           r[1],
-                    "alerted_at":     r[2],
-                    "price_at_alert": r[3],
+                    "id":                r[0],
+                    "mint":              r[1],
+                    "alerted_at":        r[2],
+                    "price_at_alert":    r[3],
                     "need_30m":  r[4] is None and (now - r[2]) >= 1800,
                     "need_1h":   r[5] is None and (now - r[2]) >= 3600,
                     "need_4h":   r[6] is None and (now - r[2]) >= 14400,
+                    "alert_message_id":  r[7],
                 })
     return rows
 
@@ -545,23 +559,27 @@ async def get_performance_summary(days_back: int = 7) -> Dict:
 
 
 async def run_performance_snapshot_worker(
-    fetch_price_fn,   # async (mint: str) -> float | None
+    fetch_price_fn,        # async (mint: str) -> float | None
+    send_reply_fn=None,    # async (text, reply_to_message_id) -> int   (optional)
     interval_seconds: int = 60,
 ):
     """
-    Background worker that fills in 30m / 1h / 4h price snapshots.
+    Background worker that fills in 30m / 1h / 4h price snapshots and sends
+    reply-threaded P&L cards back to the original alert message.
 
     Usage in lifespan():
         from database import run_performance_snapshot_worker
-        from alpha_engine import fetch_price_for_mint   # or any price fetcher
+        from alpha_engine import fetch_price_for_mint
+        from token_tracker_polling import send_telegram_reply
 
         asyncio.create_task(
-            run_performance_snapshot_worker(fetch_price_for_mint)
+            run_performance_snapshot_worker(fetch_price_for_mint, send_telegram_reply)
         )
 
     Args:
         fetch_price_fn:   Async callable (mint: str) -> Optional[float]
-                          Should return current USD price or None on failure.
+        send_reply_fn:    Async callable (text: str, reply_to_message_id: int) -> int
+                          If provided, sends a reply card to the original alert.
         interval_seconds: How often to check for pending snapshots (default 60s).
     """
     logger.info("📊 [PerfTracker] Performance snapshot worker started")
@@ -577,16 +595,41 @@ async def run_performance_snapshot_worker(
                     if price is None or price <= 0:
                         continue
 
+                    price_at_alert = row["price_at_alert"]
+                    msg_id         = row.get("alert_message_id", 0)
+
                     for window in ("30m", "1h", "4h"):
-                        if row.get(f"need_{window}"):
-                            await update_alert_performance_snapshot(
-                                row["id"], window, price, row["price_at_alert"]
+                        if not row.get(f"need_{window}"):
+                            continue
+
+                        await update_alert_performance_snapshot(
+                            row["id"], window, price, price_at_alert
+                        )
+
+                        # Send reply-threaded P&L card if we have a messenger
+                        if send_reply_fn and price_at_alert and price_at_alert > 0:
+                            pct  = (price - price_at_alert) / price_at_alert * 100
+                            mult = price / price_at_alert
+                            arrow = "🟢" if pct >= 0 else "🔴"
+                            sign  = "+" if pct >= 0 else ""
+                            card = (
+                                f"📸 <b>Snapshot [{window}]</b>\n"
+                                f"━━━━━━━━━━━━━━━━━━━━━━\n"
+                                f"{arrow} <b>Return:</b>  {sign}{pct:.1f}%  (x{mult:.2f})\n"
+                                f"📊 <b>Entry price:</b>  ${price_at_alert:.8f}\n"
+                                f"📊 <b>Now:</b>          ${price:.8f}"
                             )
-                            logger.debug(
-                                f"[PerfTracker] {window} snapshot for {row['mint'][:12]}… "
-                                f"price={price:.8f}"
-                            )
-                    await asyncio.sleep(0.2)  # polite spacing
+                            try:
+                                await send_reply_fn(card, reply_to_message_id=msg_id)
+                            except Exception as send_err:
+                                logger.debug(f"[PerfTracker] reply send error: {send_err}")
+
+                        logger.info(
+                            f"[PerfTracker] {window} snapshot {row['mint'][:12]}… "
+                            f"pct={((price-price_at_alert)/price_at_alert*100) if price_at_alert else 0:+.1f}%"
+                        )
+
+                    await asyncio.sleep(0.5)  # polite spacing
                 except Exception as e:
                     logger.debug(f"[PerfTracker] snapshot error for {row['mint'][:12]}: {e}")
 

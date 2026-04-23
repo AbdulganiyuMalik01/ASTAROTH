@@ -360,6 +360,8 @@ class TokenInfo:
     consecutive_green_polls: int = 0  # polls in a row where MC rose
     alert_suppressed_until: float = 0.0  # timestamp — don't alert before this
     first_seen_mc: float = 0.0        # MC when first tracked (for dump detection)
+    # Reply threading — stores the Telegram message_id of the initial alert
+    alert_message_id: int = 0         # used to reply-thread P&L / milestone updates
 
 tokens: Dict[str, TokenInfo] = {}
 tokens_lock = asyncio.Lock()
@@ -590,17 +592,19 @@ async def alert_worker():
             await asyncio.sleep(5)
 
 
-async def _send_telegram_direct(text: str, parse_mode: str = "HTML"):
+async def _send_telegram_direct(text: str, parse_mode: str = "HTML", reply_to_message_id: int = 0) -> int:
+    """Send a Telegram message. Returns message_id (0 on failure)."""
     if not TELEGRAM_ENABLED or not telegram_bot:
-        return
+        return 0
     try:
-        await telegram_bot.send_message(
-            chat_id=TELEGRAM_CHAT_ID,
-            text=text,
-            parse_mode=parse_mode
-        )
+        kwargs = dict(chat_id=TELEGRAM_CHAT_ID, text=text, parse_mode=parse_mode)
+        if reply_to_message_id:
+            kwargs["reply_to_message_id"] = reply_to_message_id
+        msg = await telegram_bot.send_message(**kwargs)
+        return msg.message_id if msg else 0
     except Exception as e:
         logger.error(f"Telegram send error: {e}")
+        return 0
 
 # ============================================================================
 # Telegram
@@ -630,19 +634,26 @@ async def init_telegram():
         logger.error(f"❌ Telegram init: {e}")
 
 
-async def send_telegram(text: str, parse_mode: str = "HTML"):
-    """Queue alert (rate-limited)."""
+async def send_telegram(text: str, parse_mode: str = "HTML") -> int:
+    """Queue alert (rate-limited). Returns message_id when sent directly, 0 when queued."""
     if not TELEGRAM_ENABLED or not telegram_bot:
-        return
+        return 0
     if _alert_queue is not None:
         await _alert_queue.put((text, parse_mode))
-    else:
-        await _send_telegram_direct(text, parse_mode)
+        return 0  # message_id unavailable when queued
+    return await _send_telegram_direct(text, parse_mode)
 
 
-async def send_telegram_now(text: str, parse_mode: str = "HTML"):
-    """Bypass rate limiter — for commands only."""
-    await _send_telegram_direct(text, parse_mode)
+async def send_telegram_now(text: str, parse_mode: str = "HTML") -> int:
+    """Bypass rate limiter — for commands only. Returns message_id."""
+    return await _send_telegram_direct(text, parse_mode)
+
+
+async def send_telegram_reply(text: str, reply_to_message_id: int, parse_mode: str = "HTML") -> int:
+    """Send a message as a threaded reply to a prior alert. Returns message_id."""
+    if not TELEGRAM_ENABLED or not telegram_bot or not reply_to_message_id:
+        return await _send_telegram_direct(text, parse_mode)
+    return await _send_telegram_direct(text, parse_mode, reply_to_message_id=reply_to_message_id)
 
 
 async def handle_telegram_command(text: str):
@@ -1639,89 +1650,145 @@ def format_launch_age(launched_at: float) -> str:
 
 
 def format_gem_alert(token: TokenInfo, alert_reason: str = "GEM", distro: "DistroResult" = None) -> str:
-    age_str = format_launch_age(token.launched_at)
-    # [v4.9] chain-aware URLs
+    age_str = format_launch_age(token.launched_at or token.created_at)
     chain = get_chain(token.chain_id)
     _dex_url = dex_url(token.mint, token.chain_id)
-    chain_badge = f"{chain['emoji']} <b>{chain['label']}</b>"
-    # [fix] escape dynamic fields to prevent Telegram HTML parse errors
-    safe_name = html.escape(token.name or "Unknown")
+    safe_name   = html.escape(token.name   or "Unknown")
     safe_symbol = html.escape(token.symbol or "???")
 
-    buy_pct = int(token.buy_ratio * 100)
-    txn_str = f"{token.buys_h1}B / {token.sells_h1}S" if token.buys_h1 or token.sells_h1 else "—"
+    # ── Header ────────────────────────────────────────────────────────────────
+    HEADERS = {
+        "FAST🔥":   ("⚡", "FAST RUNNER"),
+        "EARLY📈":  ("📈", "EARLY ENTRY"),
+        "VOL💰":    ("💰", "BUY VOL SPIKE"),
+        "VACCEL📊": ("📊", "VOL ACCELERATION"),
+        "KOL🐦":    ("🐦", "KOL MENTION"),
+    }
+    icon, label = HEADERS.get(alert_reason, ("🚨", "NEW GEM"))
+    chain_emoji = chain["emoji"]
+    chain_label = chain["label"]
 
-    # [v4.8] Alert header varies by trigger path
-    if alert_reason == "FAST🔥":
-        header = "⚡ <b>FAST RUNNER DETECTED!</b>\n"
-    elif alert_reason == "EARLY📈":
-        header = "📈 <b>EARLY VOL SPIKE!</b>\n"
-    elif alert_reason == "VOL💰":
-        header = "💰 <b>BUY VOLUME SIGNAL!</b>\n"
-    elif alert_reason == "VACCEL📊":
-        header = "📊 <b>VOL ACCELERATION!</b>\n"
-    else:
-        header = "🚨 <b>NEW POTENTIAL GEM!</b>\n"
+    header = (
+        f"{icon} <b>{label}</b>  {chain_emoji}<b>{chain_label}</b>\n"
+        f"━━━━━━━━━━━━━━━━━━━━━━"
+    )
 
-    # [v4.8] Live WS buy pressure string
+    # ── Identity ──────────────────────────────────────────────────────────────
+    identity = (
+        f"🪙 <b>${safe_symbol}</b>  <i>{safe_name}</i>\n"
+        f"<code>{token.mint}</code>"
+    )
+
+    # ── Market metrics ────────────────────────────────────────────────────────
+    mc_str   = f"${token.market_cap:>12,.0f}"
+    vol_str  = f"${token.volume_usd:>12,.0f}"
+    liq_str  = f"${token.liquidity:>12,.0f}"
+    age_pad  = f"{age_str:<16}"
+    buy_pct  = int(token.buy_ratio * 100)
+    txn_str  = f"{token.buys_h1}B / {token.sells_h1}S" if (token.buys_h1 or token.sells_h1) else "—"
+    bp_bar   = "▓" * (buy_pct // 10) + "░" * (10 - buy_pct // 10)
+
+    metrics = (
+        f"💎 <b>Market Cap</b>   {mc_str}\n"
+        f"📊 <b>Volume (1h)</b>  {vol_str}\n"
+        f"💧 <b>Liquidity</b>    {liq_str}\n"
+        f"🕐 <b>Age</b>          {age_pad}\n"
+        f"━━━━━━━━━━━━━━━━━━━━━━\n"
+        f"📈 <b>Buy Pressure</b> {buy_pct}%  [{bp_bar}]\n"
+        f"   <i>{txn_str} last 1h</i>"
+    )
+
+    # ── Signal tags ───────────────────────────────────────────────────────────
+    tags = []
     ws_total = token.ws_buy_count + token.ws_sell_count
-    ws_str = f"{token.ws_buy_count}B / {token.ws_sell_count}S live" if ws_total >= 5 else ""
-
-    lines = [
-        header,
-        f"<b>{safe_name}</b> — <b>#{safe_symbol}</b> | <b>${safe_symbol}</b> {chain_badge}",
-        f"<code>{token.mint}</code>\n",
-        f"💰 <b>MarketCap:</b> ${token.market_cap:,.0f}",
-        f"🕐 <b>Launch:</b> {age_str}",
-        f"📊 <b>Vol (1h):</b> ${token.volume_usd:,.0f}",
-        f"📈 <b>Buy Pressure:</b> {buy_pct}% ({txn_str})",
-        f"💧 <b>Liquidity:</b> ${token.liquidity:,.0f}",
-    ]
-
-    if ws_str:
-        lines.append(f"⚡ <b>Live Txns:</b> {ws_str}")
-    if token.holders:
-        lines.append(f"👥 <b>Holders:</b> {token.holders:,}")
-    if token.ws_discovered:
-        lines.append(f"⚡ <b>Source:</b> WebSocket (instant)")
-        if token.ws_initial_buy_sol > 0:
-            lines.append(f"🪙 <b>Initial Buy:</b> {token.ws_initial_buy_sol:.3f} SOL")
+    if ws_total >= 3:
+        tags.append(f"⚡ Live: {token.ws_buy_count}B / {token.ws_sell_count}S")
+    if token.ws_initial_buy_sol > 0:
+        tags.append(f"🪙 First buy: {token.ws_initial_buy_sol:.3f} SOL")
     if is_high_velocity(token):
-        lines.append(f"🔥 <b>MC Velocity:</b> +{token.mc_velocity:.1f}% last poll")
+        tags.append(f"🔥 MC vel +{token.mc_velocity:.1f}%")
     if is_vol_accelerating(token):
-        lines.append(f"📈 <b>Vol Accelerating ↑</b>")
-    if token.is_boosted:
-        lines.append(f"🚀 <b>DexScreener Boosted</b>")
-    # [v4.11] ETH buy volume summary
+        tags.append("📈 Vol accelerating ↑")
     if token.chain_id in ("ethereum", "bsc", "base") and token.buy_volume_h1 > 0:
-        liq_pct = f" ({token.buy_volume_h1/token.liquidity*100:.0f}% of liq)" if token.liquidity > 0 else ""
-        vol_hist_len = len(token.vol_usd_history)
-        accel_tag = " 📈accel" if is_buy_vol_accelerating(token) else ""
-        lines.append(f"💰 <b>Buy Vol (1h):</b> ${token.buy_volume_h1:,.0f}{liq_pct}{accel_tag}")
+        liq_pct = f"  ({token.buy_volume_h1/token.liquidity*100:.0f}% of liq)" if token.liquidity > 0 else ""
+        accel = " 📈" if is_buy_vol_accelerating(token) else ""
+        tags.append(f"💰 Buy vol: ${token.buy_volume_h1:,.0f}{liq_pct}{accel}")
         if token.volume_m5 > 0:
-            lines.append(f"⚡ <b>Vol (5m):</b> ${token.volume_m5:,.0f}")
-    # [v4.10] Distribution summary
+            tags.append(f"⚡ 5m vol:  ${token.volume_m5:,.0f}")
+    if token.holders:
+        tags.append(f"👥 Holders: {token.holders:,}")
+    if token.is_boosted:
+        tags.append("🚀 DexScreener Boosted")
+    if token.ws_discovered:
+        tags.append("⚡ Caught via WebSocket")
     if distro and distro.data_available:
-        lines.append(format_distro_line(distro))
+        tags.append(format_distro_line(distro))
+    if token.price_change_h1 and abs(token.price_change_h1) > 1:
+        arrow = "↑" if token.price_change_h1 > 0 else "↓"
+        tags.append(f"{'🟢' if token.price_change_h1 > 0 else '🔴'} Price 1h: {token.price_change_h1:+.1f}% {arrow}")
 
-    # [v4.9] chain-specific links
+    signals_block = ("\n━━━━━━━━━━━━━━━━━━━━━━\n" + "\n".join(f"   {t}" for t in tags)) if tags else ""
+
+    # ── Links ─────────────────────────────────────────────────────────────────
     if token.chain_id == "solana":
         pump_url = f"https://pump.fun/{token.mint}"
-        lines.append(f"\n🔗 <a href='{_dex_url}'>DexScreener</a> | <a href='{pump_url}'>Pump.fun</a>")
+        links = f"🔗 <a href='{_dex_url}'>DexScreener</a>  |  <a href='{pump_url}'>Pump.fun</a>"
+    elif token.chain_id == "bsc":
+        bsc_url = f"https://www.dextools.io/app/en/bnb/pair-explorer/{token.mint}"
+        links = f"🔗 <a href='{_dex_url}'>DexScreener</a>  |  <a href='{bsc_url}'>DexTools</a>"
+    elif token.chain_id == "base":
+        base_url = f"https://basescan.org/token/{token.mint}"
+        links = f"🔗 <a href='{_dex_url}'>DexScreener</a>  |  <a href='{base_url}'>Basescan</a>"
+    elif token.chain_id == "ethereum":
+        eth_url = f"https://etherscan.io/token/{token.mint}"
+        links = f"🔗 <a href='{_dex_url}'>DexScreener</a>  |  <a href='{eth_url}'>Etherscan</a>"
     else:
-        lines.append(f"\n🔗 <a href='{_dex_url}'>DexScreener</a>")
-    return "\n".join(lines)
+        links = f"🔗 <a href='{_dex_url}'>DexScreener</a>"
+
+    return "\n".join([header, "", identity, "", metrics, signals_block, "", links])
 
 
 def format_multiplier_update(token: TokenInfo, multiplier: float) -> str:
     elapsed_min = int((time.time() - token.last_alerted) // 60)
-    chain = get_chain(token.chain_id)
+    chain  = get_chain(token.chain_id)
     _dex_url = dex_url(token.mint, token.chain_id)
+    safe_symbol = html.escape(token.symbol or "???")
+    pnl_pct = (multiplier - 1.0) * 100
+    pnl_str = f"+{pnl_pct:.0f}%"
+    entry_mc  = f"${token.alert_mc:,.0f}"
+    now_mc    = f"${token.market_cap:,.0f}"
+    emoji = "🚀" if multiplier >= 5 else "🔥" if multiplier >= 3 else "📈"
     return (
-        f"🚀 <b>Update: #{token.symbol}</b> {chain['emoji']}{chain['label']}\n"
-        f"📈 x{multiplier:.1f} → {elapsed_min} min\n"
-        f"📊 MC ${token.alert_mc:,.0f} → ${token.market_cap:,.0f}\n"
+        f"{emoji} <b>x{multiplier:.1f} — ${safe_symbol}</b>  {chain['emoji']}{chain['label']}\n"
+        f"━━━━━━━━━━━━━━━━━━━━━━\n"
+        f"💰 <b>Return:</b>    <b>{pnl_str}</b>  (x{multiplier:.1f})\n"
+        f"📊 <b>MC Entry:</b>  {entry_mc}\n"
+        f"📊 <b>MC Now:</b>    {now_mc}\n"
+        f"⏱ <b>Time:</b>      {elapsed_min} min after alert\n"
+        f"━━━━━━━━━━━━━━━━━━━━━━\n"
         f"🔗 <a href='{_dex_url}'>DexScreener</a>"
+    )
+
+
+def format_performance_snapshot(token: TokenInfo, window: str, current_mc: float) -> str:
+    """Reply card shown at 30m / 1h / 4h after initial alert."""
+    if not token.alert_mc or token.alert_mc <= 0:
+        return ""
+    mult   = current_mc / token.alert_mc
+    pnl    = (mult - 1.0) * 100
+    arrow  = "🟢" if pnl >= 0 else "🔴"
+    sign   = "+" if pnl >= 0 else ""
+    chain  = get_chain(token.chain_id)
+    _dex_url = dex_url(token.mint, token.chain_id)
+    safe_symbol = html.escape(token.symbol or "???")
+    return (
+        f"📸 <b>Snapshot [{window}] — ${safe_symbol}</b>  {chain['emoji']}{chain['label']}\n"
+        f"━━━━━━━━━━━━━━━━━━━━━━\n"
+        f"{arrow} <b>Return:</b>  {sign}{pnl:.1f}%  (x{mult:.2f})\n"
+        f"📊 <b>MC Entry:</b> ${token.alert_mc:,.0f}\n"
+        f"📊 <b>MC Now:</b>   ${current_mc:,.0f}\n"
+        f"━━━━━━━━━━━━━━━━━━━━━━\n"
+        f"🔗 <a href='{_dex_url}'>Track</a>"
     )
 
 
@@ -2136,7 +2203,9 @@ async def run_detections(token: TokenInfo, session: aiohttp.ClientSession = None
             token.alerted = True
             token.last_alerted = now
             token.alert_mc = mc
-            await send_telegram(format_gem_alert(token, alert_reason, distro))
+            msg_id = await _send_telegram_direct(format_gem_alert(token, alert_reason, distro))
+            if msg_id:
+                token.alert_message_id = msg_id  # store for reply-threading
             src = "⚡WS" if token.ws_discovered else "📡Poll"
             buy_info = f"BR={token.buy_ratio:.0%} B1h={token.buys_h1}"
             ws_info = f"WS={token.ws_buy_count}B/{token.ws_sell_count}S" if ws_total > 0 else ""
@@ -2160,7 +2229,12 @@ async def run_detections(token: TokenInfo, session: aiohttp.ClientSession = None
         for milestone in MULTIPLIER_MILESTONES:
             if current_mult >= milestone and milestone not in token._sent_milestones:
                 token._sent_milestones.add(milestone)
-                await send_telegram(format_multiplier_update(token, milestone))
+                msg = format_multiplier_update(token, milestone)
+                # Reply to the original alert message if we have its ID
+                if token.alert_message_id:
+                    await send_telegram_reply(msg, reply_to_message_id=token.alert_message_id)
+                else:
+                    await send_telegram(msg)
                 logger.info(f"🚀 MILESTONE: ${token.symbol} x{milestone} MC=${token.market_cap:,.0f}")
                 break
 
