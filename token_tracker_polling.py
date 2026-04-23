@@ -1645,8 +1645,17 @@ def format_launch_age(launched_at: float) -> str:
         return "unknown"
     age_s = time.time() - launched_at
     if age_s < 3600:
-        return f"{int(age_s // 60)} mins ago"
-    return f"{age_s / 3600:.1f}h ago"
+        return f"{int(age_s // 60)}m"
+    return f"{age_s / 3600:.1f}h"
+
+
+def fmt_usd_short(v: float) -> str:
+    """$1.2M / $45.3K / $890"""
+    if v >= 1_000_000:
+        return f"${v/1_000_000:.1f}M"
+    if v >= 1_000:
+        return f"${v/1_000:.1f}K"
+    return f"${v:.0f}"
 
 
 def format_gem_alert(token: TokenInfo, alert_reason: str = "GEM", distro: "DistroResult" = None) -> str:
@@ -1656,117 +1665,71 @@ def format_gem_alert(token: TokenInfo, alert_reason: str = "GEM", distro: "Distr
     safe_name   = html.escape(token.name   or "Unknown")
     safe_symbol = html.escape(token.symbol or "???")
 
-    # ── Header ────────────────────────────────────────────────────────────────
-    HEADERS = {
-        "FAST🔥":   ("⚡", "FAST RUNNER"),
-        "EARLY📈":  ("📈", "EARLY ENTRY"),
-        "VOL💰":    ("💰", "BUY VOL SPIKE"),
-        "VACCEL📊": ("📊", "VOL ACCELERATION"),
-        "KOL🐦":    ("🐦", "KOL MENTION"),
+    SIGNAL_LABELS = {
+        "FAST🔥": "⚡ Fast Runner", "EARLY📈": "📈 Early Entry",
+        "VOL💰": "💰 Vol Spike", "VACCEL📊": "📊 Vol Accel", "KOL🐦": "🐦 KOL", "GEM": "💎 Gem",
     }
-    icon, label = HEADERS.get(alert_reason, ("🚨", "NEW GEM"))
-    chain_emoji = chain["emoji"]
-    chain_label = chain["label"]
+    signal_label = SIGNAL_LABELS.get(alert_reason, f"💎 {alert_reason}")
+    buy_pct = int(token.buy_ratio * 100)
+    bp_filled = buy_pct // 10
+    bp_bar = "█" * bp_filled + "░" * (10 - bp_filled)
 
-    header = (
-        f"{icon} <b>{label}</b>  {chain_emoji}<b>{chain_label}</b>\n"
-        f"━━━━━━━━━━━━━━━━━━━━━━"
-    )
+    mc_s  = fmt_usd_short(token.market_cap)
+    vol_s = fmt_usd_short(token.volume_usd)
+    liq_s = fmt_usd_short(token.liquidity)
+    txn_str = f"{token.buys_h1}B / {token.sells_h1}S" if (token.buys_h1 or token.sells_h1) else "—"
 
-    # ── Identity ──────────────────────────────────────────────────────────────
-    identity = (
-        f"🪙 <b>${safe_symbol}</b>  <i>{safe_name}</i>\n"
-        f"<code>{token.mint}</code>"
-    )
-
-    # ── Market metrics ────────────────────────────────────────────────────────
-    mc_str   = f"${token.market_cap:>12,.0f}"
-    vol_str  = f"${token.volume_usd:>12,.0f}"
-    liq_str  = f"${token.liquidity:>12,.0f}"
-    age_pad  = f"{age_str:<16}"
-    buy_pct  = int(token.buy_ratio * 100)
-    txn_str  = f"{token.buys_h1}B / {token.sells_h1}S" if (token.buys_h1 or token.sells_h1) else "—"
-    bp_bar   = "▓" * (buy_pct // 10) + "░" * (10 - buy_pct // 10)
-
-    metrics = (
-        f"💎 <b>Market Cap</b>   {mc_str}\n"
-        f"📊 <b>Volume (1h)</b>  {vol_str}\n"
-        f"💧 <b>Liquidity</b>    {liq_str}\n"
-        f"🕐 <b>Age</b>          {age_pad}\n"
-        f"━━━━━━━━━━━━━━━━━━━━━━\n"
-        f"📈 <b>Buy Pressure</b> {buy_pct}%  [{bp_bar}]\n"
-        f"   <i>{txn_str} last 1h</i>"
-    )
-
-    # ── Signal tags ───────────────────────────────────────────────────────────
-    tags = []
-    ws_total = token.ws_buy_count + token.ws_sell_count
-    if ws_total >= 3:
-        tags.append(f"⚡ Live: {token.ws_buy_count}B / {token.ws_sell_count}S")
-    if token.ws_initial_buy_sol > 0:
-        tags.append(f"🪙 First buy: {token.ws_initial_buy_sol:.3f} SOL")
-    if is_high_velocity(token):
-        tags.append(f"🔥 MC vel +{token.mc_velocity:.1f}%")
-    if is_vol_accelerating(token):
-        tags.append("📈 Vol accelerating ↑")
+    # Signal badges (compact)
+    badges = []
+    if is_high_velocity(token):          badges.append(f"🔥 +{token.mc_velocity:.0f}%")
+    if is_vol_accelerating(token):       badges.append("📈 Vol↑")
+    if token.ws_discovered:              badges.append("⚡ Live")
+    if token.is_boosted:                 badges.append("🚀 Boosted")
     if token.chain_id in ("ethereum", "bsc", "base") and token.buy_volume_h1 > 0:
-        liq_pct = f"  ({token.buy_volume_h1/token.liquidity*100:.0f}% of liq)" if token.liquidity > 0 else ""
-        accel = " 📈" if is_buy_vol_accelerating(token) else ""
-        tags.append(f"💰 Buy vol: ${token.buy_volume_h1:,.0f}{liq_pct}{accel}")
-        if token.volume_m5 > 0:
-            tags.append(f"⚡ 5m vol:  ${token.volume_m5:,.0f}")
-    if token.holders:
-        tags.append(f"👥 Holders: {token.holders:,}")
-    if token.is_boosted:
-        tags.append("🚀 DexScreener Boosted")
-    if token.ws_discovered:
-        tags.append("⚡ Caught via WebSocket")
-    if distro and distro.data_available:
-        tags.append(format_distro_line(distro))
+        badges.append(f"💰 {fmt_usd_short(token.buy_volume_h1)} buy")
     if token.price_change_h1 and abs(token.price_change_h1) > 1:
-        arrow = "↑" if token.price_change_h1 > 0 else "↓"
-        tags.append(f"{'🟢' if token.price_change_h1 > 0 else '🔴'} Price 1h: {token.price_change_h1:+.1f}% {arrow}")
+        arrow = "▲" if token.price_change_h1 > 0 else "▼"
+        badges.append(f"{'🟢' if token.price_change_h1 > 0 else '🔴'} {token.price_change_h1:+.0f}% {arrow}")
+    if distro and distro.data_available: badges.append(format_distro_line(distro))
 
-    signals_block = ("\n━━━━━━━━━━━━━━━━━━━━━━\n" + "\n".join(f"   {t}" for t in tags)) if tags else ""
-
-    # ── Links ─────────────────────────────────────────────────────────────────
+    # Chain-specific links
     if token.chain_id == "solana":
-        pump_url = f"https://pump.fun/{token.mint}"
-        links = f"🔗 <a href='{_dex_url}'>DexScreener</a>  |  <a href='{pump_url}'>Pump.fun</a>"
+        links = f"<a href='{_dex_url}'>DEX</a> · <a href='https://pump.fun/{token.mint}'>Pump</a>"
     elif token.chain_id == "bsc":
-        bsc_url = f"https://www.dextools.io/app/en/bnb/pair-explorer/{token.mint}"
-        links = f"🔗 <a href='{_dex_url}'>DexScreener</a>  |  <a href='{bsc_url}'>DexTools</a>"
+        links = f"<a href='{_dex_url}'>DEX</a> · <a href='https://dextools.io/app/en/bnb/pair-explorer/{token.mint}'>Tools</a>"
     elif token.chain_id == "base":
-        base_url = f"https://basescan.org/token/{token.mint}"
-        links = f"🔗 <a href='{_dex_url}'>DexScreener</a>  |  <a href='{base_url}'>Basescan</a>"
+        links = f"<a href='{_dex_url}'>DEX</a> · <a href='https://basescan.org/token/{token.mint}'>Scan</a>"
     elif token.chain_id == "ethereum":
-        eth_url = f"https://etherscan.io/token/{token.mint}"
-        links = f"🔗 <a href='{_dex_url}'>DexScreener</a>  |  <a href='{eth_url}'>Etherscan</a>"
+        links = f"<a href='{_dex_url}'>DEX</a> · <a href='https://etherscan.io/token/{token.mint}'>Scan</a>"
     else:
-        links = f"🔗 <a href='{_dex_url}'>DexScreener</a>"
+        links = f"<a href='{_dex_url}'>DEX</a>"
 
-    return "\n".join([header, "", identity, "", metrics, signals_block, "", links])
+    lines = [
+        f"{signal_label}  {chain['emoji']} <b>{chain['label']}</b>",
+        f"<b>${safe_symbol}</b>  <i>{safe_name}</i>",
+        f"MC <b>{mc_s}</b>  Vol <b>{vol_s}</b>  Liq <b>{liq_s}</b>  Age <b>{age_str}</b>",
+        f"[{bp_bar}] {buy_pct}%  {txn_str}",
+    ]
+    if badges:
+        lines.append("  ".join(badges[:4]))
+    lines += [
+        f"<code>{token.mint}</code>",
+        links,
+    ]
+    return "\n".join(lines)
 
 
 def format_multiplier_update(token: TokenInfo, multiplier: float) -> str:
     elapsed_min = int((time.time() - token.last_alerted) // 60)
-    chain  = get_chain(token.chain_id)
-    _dex_url = dex_url(token.mint, token.chain_id)
+    chain       = get_chain(token.chain_id)
+    _dex_url    = dex_url(token.mint, token.chain_id)
     safe_symbol = html.escape(token.symbol or "???")
-    pnl_pct = (multiplier - 1.0) * 100
-    pnl_str = f"+{pnl_pct:.0f}%"
-    entry_mc  = f"${token.alert_mc:,.0f}"
-    now_mc    = f"${token.market_cap:,.0f}"
-    emoji = "🚀" if multiplier >= 5 else "🔥" if multiplier >= 3 else "📈"
+    pnl_pct     = (multiplier - 1.0) * 100
+    emoji       = "🚀" if multiplier >= 5 else "🔥" if multiplier >= 3 else "📈"
     return (
-        f"{emoji} <b>x{multiplier:.1f} — ${safe_symbol}</b>  {chain['emoji']}{chain['label']}\n"
-        f"━━━━━━━━━━━━━━━━━━━━━━\n"
-        f"💰 <b>Return:</b>    <b>{pnl_str}</b>  (x{multiplier:.1f})\n"
-        f"📊 <b>MC Entry:</b>  {entry_mc}\n"
-        f"📊 <b>MC Now:</b>    {now_mc}\n"
-        f"⏱ <b>Time:</b>      {elapsed_min} min after alert\n"
-        f"━━━━━━━━━━━━━━━━━━━━━━\n"
-        f"🔗 <a href='{_dex_url}'>DexScreener</a>"
+        f"{emoji} <b>${safe_symbol}</b>  x{multiplier:.1f}  <b>+{pnl_pct:.0f}%</b>  {chain['emoji']}{chain['label']}\n"
+        f"{fmt_usd_short(token.alert_mc)} → {fmt_usd_short(token.market_cap)}  ·  {elapsed_min}m after alert\n"
+        f"<a href='{_dex_url}'>DEX</a>"
     )
 
 
@@ -1774,21 +1737,16 @@ def format_performance_snapshot(token: TokenInfo, window: str, current_mc: float
     """Reply card shown at 30m / 1h / 4h after initial alert."""
     if not token.alert_mc or token.alert_mc <= 0:
         return ""
-    mult   = current_mc / token.alert_mc
-    pnl    = (mult - 1.0) * 100
-    arrow  = "🟢" if pnl >= 0 else "🔴"
-    sign   = "+" if pnl >= 0 else ""
-    chain  = get_chain(token.chain_id)
-    _dex_url = dex_url(token.mint, token.chain_id)
+    mult        = current_mc / token.alert_mc
+    pnl         = (mult - 1.0) * 100
+    color       = "🟢" if pnl >= 0 else "🔴"
+    chain       = get_chain(token.chain_id)
+    _dex_url    = dex_url(token.mint, token.chain_id)
     safe_symbol = html.escape(token.symbol or "???")
     return (
-        f"📸 <b>Snapshot [{window}] — ${safe_symbol}</b>  {chain['emoji']}{chain['label']}\n"
-        f"━━━━━━━━━━━━━━━━━━━━━━\n"
-        f"{arrow} <b>Return:</b>  {sign}{pnl:.1f}%  (x{mult:.2f})\n"
-        f"📊 <b>MC Entry:</b> ${token.alert_mc:,.0f}\n"
-        f"📊 <b>MC Now:</b>   ${current_mc:,.0f}\n"
-        f"━━━━━━━━━━━━━━━━━━━━━━\n"
-        f"🔗 <a href='{_dex_url}'>Track</a>"
+        f"📊 <b>${safe_symbol}</b>  [{window}]  {color} <b>{pnl:+.1f}%</b>  x{mult:.2f}  {chain['emoji']}{chain['label']}\n"
+        f"{fmt_usd_short(token.alert_mc)} → {fmt_usd_short(current_mc)}\n"
+        f"<a href='{_dex_url}'>DEX</a>"
     )
 
 
