@@ -2619,17 +2619,11 @@ async def lifespan(app: FastAPI):
         f"{c['emoji']}{c['label']}" + (" ⚡WS" if c["has_ws"] else " 📡Poll")
         for c in CHAINS.values() if c["enabled"]
     )
+    kol_line = f"{len(kol_accounts)} accounts" if kol_accounts else "none — /addkol @handle"
     await send_telegram_now(
-        "🚀 <b>ASTAROTH v4.9 Online</b>\n\n"
-        f"🌐 <b>Chains:</b> {active_chains}\n"
-        "⚡ PumpPortal WebSocket: active (Solana)\n"
-        "📡 DexScreener polling: active (all chains)\n"
-        f"👁️ KOL monitoring: {len(kol_accounts)} accounts\n"
-        "💾 State persistence: ✅\n"
-        "🚦 Alert rate limiter: ✅\n"
-        "📈 Volume acceleration: ✅\n"
-        "🌐 Dashboard: /dashboard\n\n"
-        "Use /addkol @handle to add KOLs to monitor!"
+        "🚀 <b>ASTAROTH</b> online\n"
+        f"{active_chains}\n"
+        f"👁 KOLs: {kol_line}"
     )
 
     logger.info("✅ All tasks started")
