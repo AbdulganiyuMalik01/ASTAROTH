@@ -218,6 +218,7 @@ WS_RECONNECT_DELAY_MIN = 2    # seconds before first reconnect
 WS_RECONNECT_DELAY_MAX = 60   # cap backoff at 60s
 WS_MAX_TRADE_SUBS = 50        # max tokens to subscribe trade feed for
 WS_ENRICH_DELAY = 3           # seconds to wait after WS discovery before DexScreener fetch
+WS_SOL_PRICE_USD = float(os.getenv("SOL_PRICE_USD", "175.0"))  # used to convert WS SOL vol → USD
 
 POLL_INTERVAL = 15            # [v4.5] Reduced — WS handles discovery now
 TOKENS_PER_POLL = 30
@@ -242,7 +243,7 @@ GEM_VOL_ACCEL_MC_MAX = 500_000 # raised ceiling for vol-acceleration trigger
 MULTIPLIER_MILESTONES = [2.0, 3.0, 5.0, 10.0]
 
 # Token pool management
-MAX_TRACKED_TOKENS = 300
+MAX_TRACKED_TOKENS = 750
 TOKEN_MAX_AGE_SECONDS = 6 * 3600
 TOKEN_STALE_AGE_SECONDS = 90 * 60
 TOKEN_STALE_VOL_THRESHOLD = 5_000
@@ -286,9 +287,13 @@ boosted_mints: Set[str] = set()
 # [v4.11] Per-chain last poll timestamps for staggered chain polling
 _last_chain_poll: dict = {"ethereum": 0.0, "bsc": 0.0, "base": 0.0}
 
-# [v4.6] WS spam dedup: fingerprint -> timestamp of last seen
-ws_symbol_cooldown: Dict[str, float] = {}
+# [v4.6] WS spam dedup: symbol -> list of (timestamp, mint) tuples seen within cooldown window
+# Used to detect squatter swarms (many different mints sharing the same ticker in a short burst).
+ws_symbol_cooldown: Dict[str, list] = {}
 ws_sub_request_queue: asyncio.Queue = None  # [fix] side-channel for trade sub requests
+
+# How many distinct mints for the same symbol in WS_SYMBOL_COOLDOWN seconds = squatter swarm
+WS_SQUATTER_THRESHOLD = 4
 
 # [v4.7] KOL state
 kol_accounts: Dict[str, dict] = {}    # handle -> {added_at, last_polled, post_ids_seen}
@@ -306,6 +311,10 @@ ws_stats = {
 
 # [v4.5] Queue for WS-discovered tokens needing DexScreener enrichment
 ws_discovery_queue: asyncio.Queue = None
+
+# [v4.12] Ring buffer for /analysis endpoint — last 500 scored tokens with outcome metadata
+ANALYSIS_RING_SIZE = 500
+_analysis_ring: deque = deque(maxlen=ANALYSIS_RING_SIZE)
 
 # ============================================================================
 # Data Structures
@@ -346,9 +355,12 @@ class TokenInfo:
     # [v4.5] WS-specific fields
     ws_discovered: bool = False       # was this token found via WS (vs polling)?
     ws_initial_buy_sol: float = 0.0   # SOL in first buy (from WS create event)
+    ws_pre_enrichment: bool = False   # True = stub added before DexScreener fetch completes
     ws_buy_count: int = 0             # live buy count from WS trade feed
     ws_sell_count: int = 0            # live sell count from WS trade feed
     ws_sol_volume: float = 0.0        # live SOL volume from WS trade feed
+    ws_buy_vol_usd: float = 0.0       # live buy-side USD volume from WS trade feed
+    ws_sell_vol_usd: float = 0.0      # live sell-side USD volume from WS trade feed
     # [v4.9] multi-chain
     chain_id: str = "solana"          # which chain this token is on
     # [v4.11] ETH buy volume tracking
@@ -401,6 +413,8 @@ def _token_to_dict(token: TokenInfo) -> dict:
         "ws_buy_count": token.ws_buy_count,
         "ws_sell_count": token.ws_sell_count,
         "ws_sol_volume": token.ws_sol_volume,
+        "ws_buy_vol_usd": token.ws_buy_vol_usd,
+        "ws_sell_vol_usd": token.ws_sell_vol_usd,
         "_sent_milestones": list(getattr(token, '_sent_milestones', set())),
         "chain_id": token.chain_id,
         "buy_volume_h1": token.buy_volume_h1,
@@ -439,6 +453,8 @@ def _token_from_dict(d: dict) -> TokenInfo:
         ws_buy_count=d.get("ws_buy_count", 0),
         ws_sell_count=d.get("ws_sell_count", 0),
         ws_sol_volume=d.get("ws_sol_volume", 0.0),
+        ws_buy_vol_usd=d.get("ws_buy_vol_usd", 0.0),
+        ws_sell_vol_usd=d.get("ws_sell_vol_usd", 0.0),
         chain_id=d.get("chain_id", "solana"),
         buy_volume_h1=d.get("buy_volume_h1", 0.0),
         volume_m5=d.get("volume_m5", 0.0),
@@ -535,11 +551,17 @@ async def prune_dead_tokens():
     # [v4.6] Clean up expired WS spam cooldown entries
     if now - _last_cooldown_cleanup > WS_COOLDOWN_CLEANUP:
         _last_cooldown_cleanup = now
-        expired = [fp for fp, ts in ws_symbol_cooldown.items() if now - ts > WS_SYMBOL_COOLDOWN * 2]
-        for fp in expired:
-            del ws_symbol_cooldown[fp]
-        if expired:
-            logger.debug(f"🧹 Cleared {len(expired)} WS cooldown entries")
+        cutoff = now - WS_SYMBOL_COOLDOWN * 2
+        expired_syms = []
+        for sym, entries in ws_symbol_cooldown.items():
+            # entries is a list of (timestamp, mint) tuples
+            ws_symbol_cooldown[sym] = [(ts, m) for ts, m in entries if ts > cutoff]
+            if not ws_symbol_cooldown[sym]:
+                expired_syms.append(sym)
+        for sym in expired_syms:
+            del ws_symbol_cooldown[sym]
+        if expired_syms:
+            logger.debug(f"🧹 Cleared {len(expired_syms)} WS cooldown symbol entries")
 
     to_remove = []
     async with tokens_lock:
@@ -562,16 +584,40 @@ async def prune_dead_tokens():
 
 
 def enforce_token_cap(symbol: str) -> bool:
-    """Must be called while holding tokens_lock."""
+    """Must be called while holding tokens_lock.
+
+    Score-aware eviction: never evict tokens with consecutive_green_polls >= 2
+    (i.e. tokens showing sustained momentum). Among evictable candidates, prefer
+    to drop the lowest-scored oldest token rather than simply the oldest.
+    """
     if len(tokens) < MAX_TRACKED_TOKENS:
         return True
-    candidates = [(mint, t) for mint, t in tokens.items() if not t.alerted]
+    # Never evict: alerted tokens or tokens with sustained green momentum
+    candidates = [
+        (mint, t) for mint, t in tokens.items()
+        if not t.alerted and getattr(t, "consecutive_green_polls", 0) < 2
+    ]
     if not candidates:
-        return False
-    oldest_mint, oldest = min(candidates, key=lambda x: x[1].created_at)
-    del tokens[oldest_mint]
-    volume_history.pop(oldest_mint, None)
-    logger.debug(f"♻️ Evicted ${oldest.symbol} → ${symbol}")
+        # All tracked tokens are either alerted or on a hot streak — drop
+        # the absolute oldest non-alerted token as a last resort
+        fallback = [(mint, t) for mint, t in tokens.items() if not t.alerted]
+        if not fallback:
+            return False
+        oldest_mint, oldest = min(fallback, key=lambda x: x[1].created_at)
+        del tokens[oldest_mint]
+        volume_history.pop(oldest_mint, None)
+        logger.debug(f"♻️ Evicted (fallback) ${oldest.symbol} → ${symbol}")
+        return True
+    # Sort: primary key = composite_score asc (evict weakest first),
+    #        secondary = created_at asc (evict oldest among equally weak)
+    candidates.sort(key=lambda x: (getattr(x[1], "composite_score", 0.0), x[1].created_at))
+    evict_mint, evict_token = candidates[0]
+    del tokens[evict_mint]
+    volume_history.pop(evict_mint, None)
+    logger.debug(
+        f"♻️ Evicted ${evict_token.symbol} "
+        f"(score={getattr(evict_token, 'composite_score', 0.0):.2f}) → ${symbol}"
+    )
     return True
 
 # ============================================================================
@@ -1226,24 +1272,49 @@ async def _handle_ws_create(data: dict):
     initial_buy = float(data.get("initialBuy", 0) or 0)
     mc_sol = float(data.get("marketCapSol", 0) or 0)
 
-    # Skip if already seen by mint
+    # Primary dedup: mint address is the canonical unique key
     if mint in seen_mints:
         return
 
-    # [v4.6] Spam deduplication: same symbol + same initial_buy bucket = spam bot
-    # Bucket the initial_buy to nearest 100k to catch near-identical creates
-    buy_bucket = int(initial_buy / 100_000)
-    fingerprint = f"{symbol.upper().strip()}:{buy_bucket}"
+    # [v4.6] Squatter detection: many distinct mints for the same ticker in a short
+    # window = coordinated symbol-squatting attack. Track (timestamp, mint) pairs per symbol.
+    sym_key = symbol.upper().strip()
     now = time.time()
-    if fingerprint in ws_symbol_cooldown:
-        if now - ws_symbol_cooldown[fingerprint] < WS_SYMBOL_COOLDOWN:
-            logger.debug(f"🚫 WS spam skipped: ${symbol} (fingerprint={fingerprint})")
-            return
-    ws_symbol_cooldown[fingerprint] = now
+    cutoff = now - WS_SYMBOL_COOLDOWN
+    existing = ws_symbol_cooldown.get(sym_key, [])
+    # Prune stale entries
+    existing = [(ts, m) for ts, m in existing if ts > cutoff]
+    existing.append((now, mint))
+    ws_symbol_cooldown[sym_key] = existing
+    if len(existing) > WS_SQUATTER_THRESHOLD:
+        logger.debug(
+            f"🚫 WS squatter swarm: ${symbol} — {len(existing)} mints in {WS_SYMBOL_COOLDOWN}s"
+        )
+        return
 
     seen_mints.add(mint)
     ws_stats["tokens_discovered"] += 1
     logger.info(f"⚡ WS NEW: ${symbol} | MC: {mc_sol:.1f} SOL | Init buy: {initial_buy:.2f} SOL")
+
+    # [v4.12] Pre-track: immediately add a stub token so trade events can accumulate
+    # before DexScreener enrichment completes. Stub MC is estimated from WS data.
+    created_ts = time.time()
+    estimated_mc = mc_sol * WS_SOL_PRICE_USD
+    async with tokens_lock:
+        if mint not in tokens:
+            if enforce_token_cap(symbol):
+                tokens[mint] = TokenInfo(
+                    mint=mint,
+                    symbol=symbol,
+                    name=name,
+                    created_at=created_ts,
+                    market_cap=estimated_mc,
+                    ws_discovered=True,
+                    ws_initial_buy_sol=initial_buy,
+                    ws_pre_enrichment=True,
+                    chain_id="solana",
+                )
+                logger.debug(f"🔬 Pre-tracked ${symbol} (stub MC≈${estimated_mc:,.0f})")
 
     # Queue for DexScreener enrichment (don't fetch in WS handler — keep it fast)
     if ws_discovery_queue is not None:
@@ -1251,7 +1322,7 @@ async def _handle_ws_create(data: dict):
             "mint": mint,
             "symbol": symbol,
             "name": name,
-            "created_at": time.time(),
+            "created_at": created_ts,
             "ws_discovered": True,
             "ws_initial_buy_sol": initial_buy,
             "mc_sol_at_creation": mc_sol,
@@ -1273,13 +1344,17 @@ async def _handle_ws_trade(data: dict):
     ws_stats["trades_received"] += 1
     ws_stats["last_message_at"] = time.time()
 
+    usd_amount = sol_amount * WS_SOL_PRICE_USD
+
     async with tokens_lock:
         if mint in tokens:
             tokens[mint].ws_sol_volume += sol_amount
             if tx_type == "buy":
                 tokens[mint].ws_buy_count += 1
+                tokens[mint].ws_buy_vol_usd += usd_amount
             elif tx_type == "sell":
                 tokens[mint].ws_sell_count += 1
+                tokens[mint].ws_sell_vol_usd += usd_amount
 
 
 async def pumpfun_ws_listener():
@@ -1297,8 +1372,8 @@ async def pumpfun_ws_listener():
             logger.info(f"🔌 Connecting to PumpPortal WS: {PUMPPORTAL_WS}")
             async with websockets.connect(
                 PUMPPORTAL_WS,
-                ping_interval=30,
-                ping_timeout=10,
+                ping_interval=45,
+                ping_timeout=25,
                 close_timeout=5,
             ) as ws:
                 ws_stats["connected"] = True
@@ -1374,7 +1449,7 @@ async def ws_trade_subscription_manager():
 
     while True:
         try:
-            await asyncio.sleep(60)
+            await asyncio.sleep(15)
             if not ws_stats["connected"]:
                 continue
 
@@ -2050,6 +2125,21 @@ async def run_detections(token: TokenInfo, session: aiohttp.ClientSession = None
         if ws_buy_pressure and ws_total >= 10:
             min_buys_ok = True
 
+        # ── WS directional USD volume: net buy flow from live trade feed ──
+        # ws_buy_vol_usd / ws_sell_vol_usd give dollar-denominated pressure.
+        # Strong net buy flow (>60% buy-side) reinforces the buy_pressure signal.
+        ws_usd_total = token.ws_buy_vol_usd + token.ws_sell_vol_usd
+        ws_usd_buy_dominant = (
+            ws_usd_total >= 500  # at least $500 total flow before trusting the ratio
+            and token.ws_buy_vol_usd / max(token.ws_sell_vol_usd, 1.0) >= 1.5
+        )
+        if ws_usd_buy_dominant and not ws_buy_pressure:
+            # USD flow says buy-dominant even if txn count is low — relax gate
+            ws_buy_pressure = True
+        if ws_usd_buy_dominant and ws_usd_total >= 2000:
+            # Strong dollar flow → unconditionally relax min_buys
+            min_buys_ok = True
+
         # ── [v4.11] Anti-dump gates ──────────────────────────────────────
         # Gate 1: Price not already crashing — if price is down >20% in 1h it's a dump
         price_not_crashing = token.price_change_h1 > -20.0
@@ -2088,7 +2178,7 @@ async def run_detections(token: TokenInfo, session: aiohttp.ClientSession = None
         vol_accel_early = (
             is_vol_accelerating(token)
             and age_s < age_min
-            and age_s >= 5 * 60
+            and age_s >= 2 * 60
             and GEM_FAST_MC_MIN <= mc <= GEM_VOL_ACCEL_MC_MAX
             and liq_ok
             and buy_ratio_ok
@@ -2156,6 +2246,15 @@ async def run_detections(token: TokenInfo, session: aiohttp.ClientSession = None
 
             if not distro.passed:
                 logger.info(f"🚫 Alert blocked [{token.symbol}]: {distro.skip_reason}")
+                # [v4.12] Record distro-blocked near-miss in analysis ring
+                _analysis_ring.append({
+                    "ts": now, "mint": token.mint, "symbol": token.symbol,
+                    "chain": token.chain_id, "mc": mc, "vol": vol, "liq": liq,
+                    "age_m": round(age_s / 60, 1), "buy_ratio": token.buy_ratio,
+                    "buys_h1": token.buys_h1, "ws_buys": token.ws_buy_count,
+                    "ws_sells": token.ws_sell_count, "signal": alert_reason,
+                    "alerted": False, "skip": distro.skip_reason,
+                })
                 return  # silently drop — don't alert on bundled/concentrated tokens
 
             token.alerted = True
@@ -2174,7 +2273,43 @@ async def run_detections(token: TokenInfo, session: aiohttp.ClientSession = None
                 f"MC=${mc:,.0f} Vol={vol:,.0f} Age={int(age_s//60)}m "
                 f"{buy_info} {ws_info} {distro_info} {green_info}"
             )
+            # [v4.12] Record successful alert in analysis ring
+            _analysis_ring.append({
+                "ts": now, "mint": token.mint, "symbol": token.symbol,
+                "chain": token.chain_id, "mc": mc, "vol": vol, "liq": liq,
+                "age_m": round(age_s / 60, 1), "buy_ratio": token.buy_ratio,
+                "buys_h1": token.buys_h1, "ws_buys": token.ws_buy_count,
+                "ws_sells": token.ws_sell_count, "signal": alert_reason,
+                "alerted": True, "skip": "",
+            })
             return
+
+        # [v4.12] No detection path fired — record near-miss for /analysis visibility
+        # Skip stubs (pre-enrichment tokens have no real market data yet)
+        if not getattr(token, "ws_pre_enrichment", False):
+            # Determine which gate first failed
+            if not age_ok:
+                skip = f"age {age_s/60:.1f}m (need {age_min/60:.0f}-{age_max/3600:.0f}h)"
+            elif not mc_ok:
+                skip = f"MC ${mc:,.0f} (need ${mc_min:,.0f}-${mc_max:,.0f})"
+            elif not vol_ok:
+                skip = f"vol/MC {vol/max(mc,1):.2%} (need {vol_mc_ratio:.0%})"
+            elif not liq_ok:
+                skip = f"liq ${liq:,.0f} (need ${liq_min:,.0f})"
+            elif not buy_ratio_ok:
+                skip = f"buy_ratio {token.buy_ratio:.0%} (need {buy_ratio_min:.0%})"
+            elif not min_buys_ok:
+                skip = f"buys_h1 {token.buys_h1} (need {min_buys_h1})"
+            else:
+                skip = "no signal path matched"
+            _analysis_ring.append({
+                "ts": now, "mint": token.mint, "symbol": token.symbol,
+                "chain": token.chain_id, "mc": mc, "vol": vol, "liq": liq,
+                "age_m": round(age_s / 60, 1), "buy_ratio": token.buy_ratio,
+                "buys_h1": token.buys_h1, "ws_buys": token.ws_buy_count,
+                "ws_sells": token.ws_sell_count, "signal": None,
+                "alerted": False, "skip": skip,
+            })
 
     if token.alerted and token.alert_mc > 0:
         current_mult = token.market_cap / token.alert_mc
@@ -2366,13 +2501,37 @@ async def ws_enrich_worker(session: aiohttp.ClientSession):
                 continue
 
             async with tokens_lock:
-                if mint not in tokens:
+                real_launch = (dex_data.get("launched_at", 0.0) if dex_data else 0.0)
+                final_chain = (dex_data.get("chain_id") if dex_data else None) or ws_chain_id
+
+                if mint in tokens and tokens[mint].ws_pre_enrichment:
+                    # [v4.12] Upgrade the stub token with real DexScreener data.
+                    # Preserve trade counters that accumulated during the delay.
+                    t = tokens[mint]
+                    t.symbol = dex_data["symbol"] if dex_data else t.symbol
+                    t.name = dex_data["name"] if dex_data else t.name
+                    if real_launch:
+                        t.created_at = real_launch
+                        t.launched_at = real_launch
+                    t.market_cap = mc if mc else t.market_cap
+                    t.last_mc = t.market_cap
+                    t.volume_usd = dex_data["volume_usd"] if dex_data else t.volume_usd
+                    t.liquidity = dex_data["liquidity"] if dex_data else t.liquidity
+                    t.buy_ratio = dex_data.get("buy_ratio", t.buy_ratio) if dex_data else t.buy_ratio
+                    t.buys_h1 = dex_data.get("buys_h1", t.buys_h1) if dex_data else t.buys_h1
+                    t.sells_h1 = dex_data.get("sells_h1", t.sells_h1) if dex_data else t.sells_h1
+                    t.vol_history = [t.volume_usd] if t.volume_usd else t.vol_history
+                    t.chain_id = final_chain
+                    t.is_boosted = mint in boosted_mints
+                    t.ws_pre_enrichment = False  # fully enriched
+                    chain_label = get_chain(final_chain)["label"]
+                    logger.info(f"⚡ WS→Enriched [{chain_label}] ${sym} | MC: ${mc:,.0f} (stub upgraded)")
+
+                elif mint not in tokens:
                     if not enforce_token_cap(sym):
                         ws_discovery_queue.task_done()
                         continue
 
-                    real_launch = (dex_data.get("launched_at", 0.0) if dex_data else 0.0)
-                    final_chain = (dex_data.get("chain_id") if dex_data else None) or ws_chain_id
                     tokens[mint] = TokenInfo(
                         mint=mint,
                         symbol=dex_data["symbol"] if dex_data else token_data["symbol"],
@@ -2668,6 +2827,49 @@ async def status():
 @app.get("/dashboard", response_class=HTMLResponse)
 async def dashboard():
     return build_dashboard_html()
+
+
+@app.get("/analysis")
+async def analysis(limit: int = 100, alerted_only: bool = False, chain: str = ""):
+    """
+    [v4.12] Near-miss scoring visibility.
+    Returns the last `limit` evaluated tokens (capped at ANALYSIS_RING_SIZE=500).
+    Shows composite gate results and skip reasons so you can tune thresholds.
+    Query params:
+      - limit: how many records to return (default 100)
+      - alerted_only: if true, only return tokens that fired an alert
+      - chain: filter by chain_id (e.g. 'solana', 'ethereum')
+    """
+    records = list(_analysis_ring)
+    if alerted_only:
+        records = [r for r in records if r.get("alerted")]
+    if chain:
+        records = [r for r in records if r.get("chain") == chain]
+    records = records[-min(limit, ANALYSIS_RING_SIZE):]
+    records.reverse()  # most recent first
+
+    # Near-miss distribution: group by first failing gate
+    skip_counts: dict = {}
+    for r in records:
+        if not r.get("alerted"):
+            key = r.get("skip", "unknown")
+            # Normalise to gate name only (strip numbers)
+            if key.startswith("age"): key = "age"
+            elif key.startswith("MC"): key = "mc"
+            elif key.startswith("vol/MC"): key = "vol_mc_ratio"
+            elif key.startswith("liq"): key = "liq"
+            elif key.startswith("buy_ratio"): key = "buy_ratio"
+            elif key.startswith("buys_h1"): key = "buys_h1"
+            skip_counts[key] = skip_counts.get(key, 0) + 1
+
+    return JSONResponse({
+        "ring_size": ANALYSIS_RING_SIZE,
+        "total_in_ring": len(list(_analysis_ring)),
+        "returned": len(records),
+        "alerted_count": sum(1 for r in records if r.get("alerted")),
+        "near_miss_distribution": dict(sorted(skip_counts.items(), key=lambda x: -x[1])),
+        "records": records,
+    })
 
 @app.post("/webhook/telegram")
 async def telegram_webhook(request: Request):
