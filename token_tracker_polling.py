@@ -93,6 +93,27 @@ TELEGRAM_ENABLED = TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID
 HELIUS_API_KEY = config.api.helius_api_key
 HELIUS_RPC = f"https://mainnet.helius-rpc.com/?api-key={HELIUS_API_KEY}" if HELIUS_API_KEY else ""
 
+# [v4.24] Simple env-var helpers so detection knobs below can be retuned via
+# Railway env vars without a code change + redeploy.
+def _env_bool(name: str, default: bool) -> bool:
+    return os.getenv(name, str(default)).lower() == "true"
+
+def _env_num(name: str, default, cast=float):
+    v = os.getenv(name)
+    if v is None or v == "":
+        return default
+    try:
+        return cast(v)
+    except (TypeError, ValueError):
+        return default
+
+# [v4.24] Per-request rate limiting on all HTTP endpoints (dashboard, /analysis,
+# the Telegram webhook). RATE_LIMIT_PER_MIN overrides the default of 120/min/IP.
+rate_limiter = RateLimiter(
+    max_requests=int(_env_num("RATE_LIMIT_PER_MIN", 120, int)),
+    window_seconds=60,
+)
+
 DEXSCREENER_API = "https://api.dexscreener.com/latest/dex"
 DEXSCREENER_NEW_PAIRS = "https://api.dexscreener.com/token-profiles/latest/v1"
 DEXSCREENER_SEARCH = "https://api.dexscreener.com/latest/dex/search"
@@ -118,7 +139,7 @@ CHAIN_POLL_INTERVAL = {
 # Each chain: enabled, has_ws (PumpPortal only for Solana), dexscreener chain id, explorer base url, skip_symbols
 CHAINS: Dict[str, dict] = {
     "solana": {
-        "enabled": True,
+        "enabled": _env_bool("ENABLE_SOLANA", True),
         "has_ws": True,
         "chain_id": "solana",
         "explorer": "https://dexscreener.com/solana/{}",
@@ -126,7 +147,7 @@ CHAINS: Dict[str, dict] = {
         "emoji": "◎",
     },
     "bsc": {
-        "enabled": os.getenv("ENABLE_BSC", "true").lower() == "true",
+        "enabled": _env_bool("ENABLE_BSC", True),
         "has_ws": False,
         "chain_id": "bsc",
         "explorer": "https://dexscreener.com/bsc/{}",
@@ -134,7 +155,7 @@ CHAINS: Dict[str, dict] = {
         "emoji": "🟡",
     },
     "base": {
-        "enabled": os.getenv("ENABLE_BASE", "true").lower() == "true",
+        "enabled": _env_bool("ENABLE_BASE", True),
         "has_ws": False,
         "chain_id": "base",
         "explorer": "https://dexscreener.com/base/{}",
@@ -142,7 +163,7 @@ CHAINS: Dict[str, dict] = {
         "emoji": "🔵",
     },
     "ethereum": {
-        "enabled": os.getenv("ENABLE_ETH", "true").lower() == "true",
+        "enabled": _env_bool("ENABLE_ETH", True),
         "has_ws": False,
         "chain_id": "ethereum",
         "explorer": "https://dexscreener.com/ethereum/{}",
@@ -152,48 +173,28 @@ CHAINS: Dict[str, dict] = {
 }
 
 # [v4.10] Per-chain detection thresholds
-# Each chain has different token lifecycle, MC ranges, and trading behaviour
+# Each chain has different token lifecycle, MC ranges, and trading behaviour.
+# [v4.24] Every value below is overridable via env var (e.g. SOL_MC_MIN=15000)
+# so retuning a chain no longer requires a code change + redeploy — the
+# literal below each one is just the default when no env var is set.
+def _chain_thresholds(prefix: str, age_min, age_max, mc_min, mc_max,
+                       vol_mc_ratio, liq_min, buy_ratio_min, min_buys_h1) -> dict:
+    return {
+        "age_min":       _env_num(f"{prefix}_AGE_MIN", age_min, int),
+        "age_max":       _env_num(f"{prefix}_AGE_MAX", age_max, int),
+        "mc_min":        _env_num(f"{prefix}_MC_MIN", mc_min, float),
+        "mc_max":        _env_num(f"{prefix}_MC_MAX", mc_max, float),
+        "vol_mc_ratio":  _env_num(f"{prefix}_VOL_MC_RATIO", vol_mc_ratio, float),
+        "liq_min":       _env_num(f"{prefix}_LIQ_MIN", liq_min, float),
+        "buy_ratio_min": _env_num(f"{prefix}_BUY_RATIO_MIN", buy_ratio_min, float),
+        "min_buys_h1":   _env_num(f"{prefix}_MIN_BUYS_H1", min_buys_h1, int),
+    }
+
 CHAIN_THRESHOLDS = {
-    "solana": {
-        "age_min":      3 * 60,      # 3 min — catch runners at launch
-        "age_max":      6 * 3600,    # 6 hours — runners can sustain
-        "mc_min":       10_000,      # catch early before MC pumps
-        "mc_max":       2_000_000,   # don't miss mid-cap runners
-        "vol_mc_ratio": 0.15,        # lowered — early tokens have less vol
-        "liq_min":      5_000,       # young tokens have less liq
-        "buy_ratio_min": 0.52,
-        "min_buys_h1":  10,
-    },
-    "bsc": {
-        "age_min":      2 * 60,      # 2 min — BSC launches very fast
-        "age_max":      12 * 3600,   # 12 hours — BSC runners sustain longer
-        "mc_min":       8_000,
-        "mc_max":       5_000_000,
-        "vol_mc_ratio": 0.08,
-        "liq_min":      5_000,
-        "buy_ratio_min": 0.52,
-        "min_buys_h1":  8,
-    },
-    "base": {
-        "age_min":      3 * 60,
-        "age_max":      6 * 3600,
-        "mc_min":       10_000,
-        "mc_max":       3_000_000,
-        "vol_mc_ratio": 0.10,
-        "liq_min":      5_000,
-        "buy_ratio_min": 0.52,
-        "min_buys_h1":  8,
-    },
-    "ethereum": {
-        "age_min":      2 * 60,      # 2 min — catch ETH runners at the start
-        "age_max":      24 * 3600,   # 24 hours — ETH runners sustain much longer
-        "mc_min":       15_000,
-        "mc_max":       500_000,     # widened — don't miss ETH mid-caps
-        "vol_mc_ratio": 0.05,        # ETH trades slowly — 5% is meaningful signal
-        "liq_min":      5_000,
-        "buy_ratio_min": 0.52,
-        "min_buys_h1":  3,           # ETH has fewer txns on small caps
-    },
+    "solana":   _chain_thresholds("SOL",  3 * 60,  6 * 3600, 10_000,     2_000_000, 0.15, 5_000, 0.52, 10),
+    "bsc":      _chain_thresholds("BSC",  2 * 60, 12 * 3600,  8_000,     5_000_000, 0.08, 5_000, 0.52, 8),
+    "base":     _chain_thresholds("BASE", 3 * 60,  6 * 3600, 10_000,     3_000_000, 0.10, 5_000, 0.52, 8),
+    "ethereum": _chain_thresholds("ETH",  2 * 60, 24 * 3600, 15_000,       500_000, 0.05, 5_000, 0.52, 3),
 }
 
 def get_thresholds(chain_id: str) -> dict:
@@ -2802,6 +2803,16 @@ async def lifespan(app: FastAPI):
 
 
 app = FastAPI(lifespan=lifespan)
+
+@app.middleware("http")
+async def _rate_limit_middleware(request: Request, call_next):
+    """[v4.24] Apply webhook_security.RateLimiter to every route. Was imported
+    but never wired up — endpoints (including /webhook/telegram) had zero
+    rate limiting before this."""
+    client_ip = request.client.host if request.client else "unknown"
+    if not rate_limiter.is_allowed(client_ip):
+        return JSONResponse({"ok": False, "error": "rate limit exceeded"}, status_code=429)
+    return await call_next(request)
 
 @app.get("/")
 async def root():
