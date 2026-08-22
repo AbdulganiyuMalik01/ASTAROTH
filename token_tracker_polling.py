@@ -140,11 +140,24 @@ CHAIN_POLL_INTERVAL = {
 # existing PumpPortal WS, which is purpose-built for pump.fun and stays as-is).
 # Leave ALCHEMY_API_KEY unset to keep these three chains on DexScreener polling
 # only — nothing below changes behavior until a key is configured.
+#
+# Alchemy apps are network-scoped in the dashboard — a key only works on the
+# networks enabled for that specific app (a wrong/un-enabled network fails
+# WS auth with HTTP 403, not the "invalid key" 401 you'd expect from a bad
+# key). If one chain 403s while another with the same key works, that's the
+# fix: open the app in the Alchemy dashboard and add the missing network to
+# it. As an alternative (e.g. separate apps per chain), an optional
+# per-chain override is supported: ALCHEMY_API_KEY_BSC / _BASE / _ETHEREUM,
+# each falling back to ALCHEMY_API_KEY if unset.
 ALCHEMY_API_KEY = os.getenv("ALCHEMY_API_KEY", "").strip()
+
+def _alchemy_key_for(chain_id: str) -> str:
+    return os.getenv(f"ALCHEMY_API_KEY_{chain_id.upper()}", "").strip() or ALCHEMY_API_KEY
+
 ALCHEMY_WS_URLS = {
-    "ethereum": f"wss://eth-mainnet.g.alchemy.com/v2/{ALCHEMY_API_KEY}",
-    "bsc":      f"wss://bnb-mainnet.g.alchemy.com/v2/{ALCHEMY_API_KEY}",
-    "base":     f"wss://base-mainnet.g.alchemy.com/v2/{ALCHEMY_API_KEY}",
+    "ethereum": f"wss://eth-mainnet.g.alchemy.com/v2/{_alchemy_key_for('ethereum')}",
+    "bsc":      f"wss://bnb-mainnet.g.alchemy.com/v2/{_alchemy_key_for('bsc')}",
+    "base":     f"wss://base-mainnet.g.alchemy.com/v2/{_alchemy_key_for('base')}",
 }
 
 # keccak256 topic0 hashes — identical across every V2/V3-style fork since the
@@ -209,7 +222,7 @@ CHAINS: Dict[str, dict] = {
     },
     "bsc": {
         "enabled": _env_bool("ENABLE_BSC", True),
-        "has_ws": bool(ALCHEMY_API_KEY),
+        "has_ws": bool(_alchemy_key_for("bsc")),
         "chain_id": "bsc",
         "explorer": "https://dexscreener.com/bsc/{}",
         "label": "BSC",
@@ -217,7 +230,7 @@ CHAINS: Dict[str, dict] = {
     },
     "base": {
         "enabled": _env_bool("ENABLE_BASE", True),
-        "has_ws": bool(ALCHEMY_API_KEY),
+        "has_ws": bool(_alchemy_key_for("base")),
         "chain_id": "base",
         "explorer": "https://dexscreener.com/base/{}",
         "label": "BASE",
@@ -225,7 +238,7 @@ CHAINS: Dict[str, dict] = {
     },
     "ethereum": {
         "enabled": _env_bool("ENABLE_ETH", True),
-        "has_ws": bool(ALCHEMY_API_KEY),
+        "has_ws": bool(_alchemy_key_for("ethereum")),
         "chain_id": "ethereum",
         "explorer": "https://dexscreener.com/ethereum/{}",
         "label": "ETH",
@@ -1570,8 +1583,8 @@ async def evm_ws_listener(chain_id: str):
     no configured factories — the existing DexScreener poll loop keeps running
     as the only discovery path in that case, exactly as before this feature.
     """
-    if not ALCHEMY_API_KEY:
-        logger.info(f"⏭️  Alchemy WS skipped for {chain_id} — ALCHEMY_API_KEY not set (polling only)")
+    if not _alchemy_key_for(chain_id):
+        logger.info(f"⏭️  Alchemy WS skipped for {chain_id} — no API key configured (polling only)")
         return
 
     factories = EVM_FACTORIES.get(chain_id, [])
@@ -1670,7 +1683,13 @@ async def evm_ws_listener(chain_id: str):
         except Exception as e:
             stats["connected"] = False
             stats["reconnects"] += 1
-            logger.warning(f"🔌 Alchemy WS [{chain_label}] disconnected: {e} — reconnecting in {delay}s")
+            hint = ""
+            if "403" in str(e):
+                hint = (f" — HTTP 403 usually means this Alchemy app doesn't have "
+                        f"the {chain_label} network enabled (Alchemy apps are "
+                        f"network-scoped in the dashboard); add it there, or set "
+                        f"ALCHEMY_API_KEY_{chain_id.upper()} to a key from an app that has it")
+            logger.warning(f"🔌 Alchemy WS [{chain_label}] disconnected: {e}{hint} — reconnecting in {delay}s")
             await asyncio.sleep(delay)
             delay = min(delay * 2, WS_EVM_RECONNECT_DELAY_MAX)
 
