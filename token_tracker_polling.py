@@ -135,8 +135,69 @@ CHAIN_POLL_INTERVAL = {
     "base":     20,   # Base is fast
 }
 
+# [v4.25] Alchemy WS — push-based new-pair detection for BSC/Base/Ethereum.
+# One free Alchemy account/API key works across all three (Solana keeps its
+# existing PumpPortal WS, which is purpose-built for pump.fun and stays as-is).
+# Leave ALCHEMY_API_KEY unset to keep these three chains on DexScreener polling
+# only — nothing below changes behavior until a key is configured.
+ALCHEMY_API_KEY = os.getenv("ALCHEMY_API_KEY", "").strip()
+ALCHEMY_WS_URLS = {
+    "ethereum": f"wss://eth-mainnet.g.alchemy.com/v2/{ALCHEMY_API_KEY}",
+    "bsc":      f"wss://bnb-mainnet.g.alchemy.com/v2/{ALCHEMY_API_KEY}",
+    "base":     f"wss://base-mainnet.g.alchemy.com/v2/{ALCHEMY_API_KEY}",
+}
+
+# keccak256 topic0 hashes — identical across every V2/V3-style fork since the
+# event signatures never change. Verified against live BscScan/Etherscan logs.
+_PAIR_CREATED_TOPIC = "0x0d3648bd0f6ba80134a33ba9275ac585d9d315f0ad8355cddefde31afa28d0e"  # PairCreated(address,address,address,uint256)
+_POOL_CREATED_TOPIC = "0x783cca1c0412dd0d695e784568c96da2e9c22ff989357a2e8b1d9b2b4e6b661"  # PoolCreated(address,address,uint24,int24,address)
+
+# Factory contracts to watch per chain. Addresses verified against BscScan /
+# Etherscan / BaseScan on 2026-08-22 — these are long-lived, canonical
+# deployments and shouldn't need updating, but if a chain silently stops
+# producing WS discoveries, check here first (a DEX may have shipped a new
+# factory version since).
+EVM_FACTORIES = {
+    "bsc": [
+        {"address": "0xcA143Ce32Fe78f1f7019d7d551a6402fC5350c73", "topic": _PAIR_CREATED_TOPIC, "dex": "PancakeV2"},
+        {"address": "0x0BFbCF9fa4f9C56B0F40a671Ad40E0805A091865", "topic": _POOL_CREATED_TOPIC, "dex": "PancakeV3"},
+    ],
+    "ethereum": [
+        {"address": "0x5C69bEe701ef814a2B6a3EDD4B1652CB9cc5aA6f", "topic": _PAIR_CREATED_TOPIC, "dex": "UniswapV2"},
+        {"address": "0x1F98431c8aD98523631AE4a59f267346ea31F984", "topic": _POOL_CREATED_TOPIC, "dex": "UniswapV3"},
+    ],
+    "base": [
+        {"address": "0x33128a8fC17869897dcE68Ed026d694621f6FDfD", "topic": _POOL_CREATED_TOPIC, "dex": "UniswapV3"},
+    ],
+}
+
+# The "other side" of a pair — when a factory event fires, whichever token is
+# NOT one of these is the new listing. If neither side matches (two unknown
+# tokens paired together) we fall back to token0 as a best-effort guess.
+EVM_BASE_TOKENS = {
+    "bsc": {
+        "0xbb4cdb9cbd36b01bd1cbaebf2de08d9173bc095c",  # WBNB
+        "0x55d398326f99059ff775485246999027b3197955",  # USDT (BSC-USD)
+        "0xe9e7cea3dedca5984780bafc599bd69add087d56",  # BUSD
+        "0x8ac76a51cc950d9822d68b83fe1ad97b32cd580d",  # USDC
+    },
+    "ethereum": {
+        "0xc02aaa39b223fe8d0a0e5c4f27ead9083c756cc2",  # WETH
+        "0xdac17f958d2ee523a2206206994597c13d831ec7",  # USDT
+        "0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48",  # USDC
+    },
+    "base": {
+        "0x4200000000000000000000000000000000000006",  # WETH
+        "0x833589fcd6edb6e08f4c7c32d4f71b54bda02913",  # USDC
+    },
+}
+
+WS_EVM_RECONNECT_DELAY_MIN = 2
+WS_EVM_RECONNECT_DELAY_MAX = 60
+
 # [v4.9] Multi-chain support
-# Each chain: enabled, has_ws (PumpPortal only for Solana), dexscreener chain id, explorer base url, skip_symbols
+# Each chain: enabled, has_ws (PumpPortal for Solana, Alchemy for the rest —
+# only on if ALCHEMY_API_KEY is set), dexscreener chain id, explorer base url
 CHAINS: Dict[str, dict] = {
     "solana": {
         "enabled": _env_bool("ENABLE_SOLANA", True),
@@ -148,7 +209,7 @@ CHAINS: Dict[str, dict] = {
     },
     "bsc": {
         "enabled": _env_bool("ENABLE_BSC", True),
-        "has_ws": False,
+        "has_ws": bool(ALCHEMY_API_KEY),
         "chain_id": "bsc",
         "explorer": "https://dexscreener.com/bsc/{}",
         "label": "BSC",
@@ -156,7 +217,7 @@ CHAINS: Dict[str, dict] = {
     },
     "base": {
         "enabled": _env_bool("ENABLE_BASE", True),
-        "has_ws": False,
+        "has_ws": bool(ALCHEMY_API_KEY),
         "chain_id": "base",
         "explorer": "https://dexscreener.com/base/{}",
         "label": "BASE",
@@ -164,7 +225,7 @@ CHAINS: Dict[str, dict] = {
     },
     "ethereum": {
         "enabled": _env_bool("ENABLE_ETH", True),
-        "has_ws": False,
+        "has_ws": bool(ALCHEMY_API_KEY),
         "chain_id": "ethereum",
         "explorer": "https://dexscreener.com/ethereum/{}",
         "label": "ETH",
@@ -308,6 +369,12 @@ ws_stats = {
     "trades_received": 0,
     "last_message_at": 0.0,
     "trade_subs": 0,
+}
+
+# [v4.25] Alchemy WS stats — one entry per EVM chain with has_ws enabled
+evm_ws_stats: Dict[str, dict] = {
+    cid: {"connected": False, "reconnects": 0, "pairs_discovered": 0, "last_message_at": 0.0}
+    for cid in ("bsc", "base", "ethereum")
 }
 
 # [v4.5] Queue for WS-discovered tokens needing DexScreener enrichment
@@ -1477,6 +1544,135 @@ async def ws_trade_subscription_manager():
             break
         except Exception as e:
             logger.debug(f"Trade sub manager error: {e}")
+
+# ============================================================================
+# [v4.25] Alchemy EVM WS Listener — BSC / Base / Ethereum
+# ============================================================================
+
+def _topic_to_address(topic_hex: str) -> str:
+    """A 32-byte indexed-address topic is left-zero-padded — the address is
+    the rightmost 20 bytes (40 hex chars)."""
+    return "0x" + topic_hex[-40:]
+
+
+async def evm_ws_listener(chain_id: str):
+    """
+    Push-based new-pair discovery for an EVM chain via Alchemy WS.
+
+    Subscribes to eth_subscribe/logs for the chain's known DEX factory
+    contracts (PairCreated for V2-style, PoolCreated for V3-style), decodes
+    the newly-listed token address out of the log's indexed topics, and feeds
+    it into the same ws_discovery_queue the Solana WS path uses — enrichment
+    (get_dex_data, threshold checks, TokenInfo creation) is already
+    chain-agnostic, so no changes are needed downstream.
+
+    No-ops (logs once, returns) if ALCHEMY_API_KEY isn't set or this chain has
+    no configured factories — the existing DexScreener poll loop keeps running
+    as the only discovery path in that case, exactly as before this feature.
+    """
+    if not ALCHEMY_API_KEY:
+        logger.info(f"⏭️  Alchemy WS skipped for {chain_id} — ALCHEMY_API_KEY not set (polling only)")
+        return
+
+    factories = EVM_FACTORIES.get(chain_id, [])
+    ws_url = ALCHEMY_WS_URLS.get(chain_id)
+    if not factories or not ws_url:
+        return
+
+    addresses = [f["address"] for f in factories]
+    topics = list({f["topic"] for f in factories})  # OR'd within this topic slot
+    base_tokens = EVM_BASE_TOKENS.get(chain_id, set())
+    dex_by_topic = {f["topic"]: f["dex"] for f in factories}
+
+    delay = WS_EVM_RECONNECT_DELAY_MIN
+    stats = evm_ws_stats[chain_id]
+    chain_label = get_chain(chain_id)["label"]
+
+    while True:
+        try:
+            logger.info(f"🔌 Connecting to Alchemy WS [{chain_label}]")
+            async with websockets.connect(
+                ws_url,
+                ping_interval=45,
+                ping_timeout=25,
+                close_timeout=5,
+            ) as ws:
+                stats["connected"] = True
+                stats["last_message_at"] = time.time()
+                delay = WS_EVM_RECONNECT_DELAY_MIN
+                logger.info(f"✅ Alchemy WS connected [{chain_label}]")
+
+                await ws.send(json.dumps({
+                    "jsonrpc": "2.0",
+                    "id": 1,
+                    "method": "eth_subscribe",
+                    "params": ["logs", {"address": addresses, "topics": [topics]}],
+                }))
+
+                async for message in ws:
+                    try:
+                        data = json.loads(message)
+                        stats["last_message_at"] = time.time()
+
+                        # Subscription ack: {"id":1,"result":"0x..."} — nothing to do
+                        if "result" in data and "params" not in data:
+                            continue
+
+                        log = data.get("params", {}).get("result")
+                        if not log:
+                            continue
+
+                        log_topics = log.get("topics", [])
+                        if len(log_topics) < 3:
+                            continue
+
+                        topic0 = log_topics[0].lower()
+                        dex_name = dex_by_topic.get(topic0, "?")
+                        token0 = _topic_to_address(log_topics[1]).lower()
+                        token1 = _topic_to_address(log_topics[2]).lower()
+
+                        if token0 in base_tokens and token1 not in base_tokens:
+                            new_token = token1
+                        elif token1 in base_tokens and token0 not in base_tokens:
+                            new_token = token0
+                        elif token0 not in base_tokens and token1 not in base_tokens:
+                            new_token = token0  # neither side recognized — best effort
+                        else:
+                            continue  # both sides are base tokens (e.g. USDC/WETH) — not a new listing
+
+                        if new_token in seen_mints:
+                            continue
+                        seen_mints.add(new_token)
+                        stats["pairs_discovered"] += 1
+                        logger.info(f"⚡ WS NEW [{chain_label}/{dex_name}]: {new_token[:10]}...")
+
+                        if ws_discovery_queue is not None:
+                            await ws_discovery_queue.put({
+                                "mint": new_token,
+                                "symbol": "NEW",
+                                "name": "NEW",
+                                "created_at": time.time(),
+                                "ws_discovered": True,
+                                "ws_initial_buy_sol": 0.0,
+                                "mc_sol_at_creation": 0.0,
+                                "chain_id": chain_id,
+                            })
+
+                    except json.JSONDecodeError:
+                        pass
+                    except Exception as e:
+                        logger.debug(f"Alchemy WS [{chain_label}] message error: {e}")
+
+        except asyncio.CancelledError:
+            logger.info(f"🔌 Alchemy WS [{chain_label}] listener cancelled")
+            stats["connected"] = False
+            break
+        except Exception as e:
+            stats["connected"] = False
+            stats["reconnects"] += 1
+            logger.warning(f"🔌 Alchemy WS [{chain_label}] disconnected: {e} — reconnecting in {delay}s")
+            await asyncio.sleep(delay)
+            delay = min(delay * 2, WS_EVM_RECONNECT_DELAY_MAX)
 
 # ============================================================================
 # DexScreener Enrichment
@@ -2763,6 +2959,14 @@ async def lifespan(app: FastAPI):
     ws_sub_task = asyncio.create_task(ws_trade_subscription_manager())
     polling_task = asyncio.create_task(polling_loop())
 
+    # [v4.25] One Alchemy WS listener per EVM chain that's enabled with has_ws
+    # (i.e. ALCHEMY_API_KEY is set). No-ops harmlessly per-chain otherwise.
+    evm_ws_tasks = [
+        asyncio.create_task(evm_ws_listener(cid))
+        for cid in ("bsc", "base", "ethereum")
+        if get_chain(cid)["enabled"] and get_chain(cid)["has_ws"]
+    ]
+
     if _RUNNER_DETECTOR_AVAILABLE:
         logger.info("🏃 Runner detection enabled")
 
@@ -2789,9 +2993,10 @@ async def lifespan(app: FastAPI):
     logger.info("✅ All tasks started")
     yield
 
-    for task in [polling_task, ws_task, ws_sub_task, alert_task, kol_task]:
+    all_tasks = [polling_task, ws_task, ws_sub_task, alert_task, kol_task] + evm_ws_tasks
+    for task in all_tasks:
         task.cancel()
-    for task in [polling_task, ws_task, ws_sub_task, alert_task, kol_task]:
+    for task in all_tasks:
         try:
             await task
         except asyncio.CancelledError:
@@ -2830,6 +3035,7 @@ async def status():
         "token_cap": MAX_TRACKED_TOKENS,
         "gems_alerted": sum(1 for t in tokens.values() if t.alerted),
         "ws": ws_stats,
+        "evm_ws": {cid: s for cid, s in evm_ws_stats.items() if get_chain(cid)["has_ws"]},
         "alert_queue": _alert_queue.qsize() if _alert_queue else 0,
         "mode": "websocket+polling",
         "runner_detection": _RUNNER_DETECTOR_AVAILABLE,
