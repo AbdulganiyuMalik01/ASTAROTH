@@ -293,6 +293,13 @@ WS_RECONNECT_DELAY_MIN = 2    # seconds before first reconnect
 WS_RECONNECT_DELAY_MAX = 60   # cap backoff at 60s
 WS_MAX_TRADE_SUBS = 50        # max tokens to subscribe trade feed for
 WS_ENRICH_DELAY = 3           # seconds to wait after WS discovery before DexScreener fetch
+# [v4.26] If that first fetch comes back empty (DexScreener hasn't indexed the
+# pair yet — common on brand-new pairs, and common enough on EVM chains that
+# the new Alchemy WS discovery would otherwise mostly finalize as empty
+# stubs), retry in the background at these additional delays before giving up.
+# Without this, a token's liquidity/volume/buys got permanently locked at
+# zero on a single miss and could never pass any alert threshold again.
+WS_ENRICH_RETRY_DELAYS = [7, 15, 30]
 WS_SOL_PRICE_USD = float(os.getenv("SOL_PRICE_USD", "175.0"))  # used to convert WS SOL vol → USD
 
 POLL_INTERVAL = 15            # [v4.5] Reduced — WS handles discovery now
@@ -2650,12 +2657,122 @@ a{{color:#00ccff;}}
 # [v4.5] WS Discovery Queue Processor
 # ============================================================================
 
+_WS_ENRICH_SKIP_SYMBOLS = {"SOL", "USDC", "USDT", "BTC", "ETH", "BONK", "WIF", "JUP", "RAY", "BSC", "BASE", "BNB", "WBNB", "WETH", "WBTC", "DAI", "BUSD", "CAKE", "ETHEREUM", "UNISWAP", "UNI", "LINK", "AAVE", "MKR", "COMP", "SNX"}
+
+
+async def _finalize_ws_token(mint: str, token_data: dict, chain_id: str, dex_data: Optional[Dict], sym: str, mc: float) -> None:
+    """
+    Shared finalize step for a WS-discovered token — used both right after a
+    successful first-attempt fetch and from the background retry path below
+    (on eventual success, or once retries are exhausted and we're finalizing
+    with whatever's available). Upgrades an existing pre-track stub in place,
+    or creates a new TokenInfo if this token was never pre-tracked (e.g. a
+    KOL-resolved mint, or an EVM pair — those have no pre-track stub).
+    """
+    async with tokens_lock:
+        real_launch = (dex_data.get("launched_at", 0.0) if dex_data else 0.0)
+        final_chain = (dex_data.get("chain_id") if dex_data else None) or chain_id
+
+        if mint in tokens and tokens[mint].ws_pre_enrichment:
+            # [v4.12] Upgrade the stub token with real DexScreener data.
+            # Preserve trade counters that accumulated during the delay.
+            t = tokens[mint]
+            t.symbol = dex_data["symbol"] if dex_data else t.symbol
+            t.name = dex_data["name"] if dex_data else t.name
+            if real_launch:
+                t.created_at = real_launch
+                t.launched_at = real_launch
+            t.market_cap = mc if mc else t.market_cap
+            t.last_mc = t.market_cap
+            t.volume_usd = dex_data["volume_usd"] if dex_data else t.volume_usd
+            t.liquidity = dex_data["liquidity"] if dex_data else t.liquidity
+            t.buy_ratio = dex_data.get("buy_ratio", t.buy_ratio) if dex_data else t.buy_ratio
+            t.buys_h1 = dex_data.get("buys_h1", t.buys_h1) if dex_data else t.buys_h1
+            t.sells_h1 = dex_data.get("sells_h1", t.sells_h1) if dex_data else t.sells_h1
+            t.vol_history = [t.volume_usd] if t.volume_usd else t.vol_history
+            t.chain_id = final_chain
+            t.is_boosted = mint in boosted_mints
+            t.ws_pre_enrichment = False  # fully enriched (or retries exhausted — see caller)
+            chain_label = get_chain(final_chain)["label"]
+            if dex_data:
+                logger.info(f"⚡ WS→Enriched [{chain_label}] ${sym} | MC: ${t.market_cap:,.0f} (stub upgraded)")
+            else:
+                logger.info(f"⚡ WS→Enriched [{chain_label}] ${sym} | MC: ${t.market_cap:,.0f} (DexScreener never indexed it — using WS estimate)")
+
+        elif mint not in tokens:
+            if not dex_data:
+                return  # never had a stub and DexScreener never resolved it — nothing to track
+            if not enforce_token_cap(sym):
+                return
+
+            tokens[mint] = TokenInfo(
+                mint=mint,
+                symbol=dex_data["symbol"],
+                name=dex_data["name"],
+                created_at=real_launch if real_launch else token_data["created_at"],
+                launched_at=real_launch,
+                market_cap=mc,
+                volume_usd=dex_data["volume_usd"],
+                liquidity=dex_data["liquidity"],
+                buy_ratio=dex_data.get("buy_ratio", 0.5),
+                buys_h1=dex_data.get("buys_h1", 0),
+                sells_h1=dex_data.get("sells_h1", 0),
+                last_mc=mc,
+                is_boosted=mint in boosted_mints,
+                vol_history=[dex_data["volume_usd"]] if dex_data["volume_usd"] else [],
+                ws_discovered=True,
+                ws_initial_buy_sol=token_data.get("ws_initial_buy_sol", 0.0),
+                chain_id=final_chain,
+            )
+            chain_label = get_chain(final_chain)["label"]
+            logger.info(f"⚡ WS→Tracked [{chain_label}] ${sym} | MC: ${mc:,.0f}")
+
+
+async def _retry_ws_enrich(session: aiohttp.ClientSession, mint: str, token_data: dict, chain_id: str, sym: str) -> None:
+    """
+    [v4.26] Background retry for a WS-discovered token whose first DexScreener
+    lookup came back empty. Runs as its own task so a slow-to-index (or dead)
+    pair never blocks ws_enrich_worker from processing the rest of the queue.
+    Tries again at each of WS_ENRICH_RETRY_DELAYS; on success, finalizes with
+    real data. If every retry still comes up empty, finalizes anyway with
+    whatever's available (the WS-estimated stub MC, for a pre-tracked token)
+    rather than leaving the stub in permanent limbo.
+    """
+    dex_data = None
+    for delay in WS_ENRICH_RETRY_DELAYS:
+        await asyncio.sleep(delay)
+        try:
+            dex_data = await get_dex_data(session, mint, chain_id)
+        except Exception as e:
+            logger.debug(f"Retry enrich error for ${sym}: {e}")
+            dex_data = None
+        if dex_data and dex_data.get("market_cap", 0) >= 1_000:
+            break
+        dex_data = None  # treat "found but still ~$0" the same as a miss — keep retrying
+
+    mc = dex_data["market_cap"] if dex_data else 0.0
+    final_sym = dex_data["symbol"].upper() if dex_data else sym
+
+    if dex_data and (final_sym in _WS_ENRICH_SKIP_SYMBOLS or mc > 5_000_000):
+        # A late-arriving lookup revealed this was junk (or resolved to a
+        # base/quote asset, not a real new listing) — drop the stub instead
+        # of finalizing it as a trackable token.
+        async with tokens_lock:
+            if mint in tokens and tokens[mint].ws_pre_enrichment:
+                del tokens[mint]
+        return
+
+    await _finalize_ws_token(mint, token_data, chain_id, dex_data, final_sym, mc)
+
+
 async def ws_enrich_worker(session: aiohttp.ClientSession):
     """
     Drains ws_discovery_queue. For each WS-discovered token:
     1. Waits WS_ENRICH_DELAY seconds (let DexScreener index it first)
     2. Fetches enriched data from DexScreener
-    3. Adds to token pool
+    3. Adds to token pool, or — if DexScreener hasn't indexed it yet —
+       hands off to a background retry task (_retry_ws_enrich) instead of
+       giving up, so this worker keeps draining the queue without delay.
     Also handles KOL-sourced symbol searches (mint=None, search_by_symbol=True).
     """
     while True:
@@ -2705,70 +2822,25 @@ async def ws_enrich_worker(session: aiohttp.ClientSession):
             ws_chain_id = token_data.get("chain_id", "solana")
             dex_data = await get_dex_data(session, mint, ws_chain_id)
 
-            mc = dex_data["market_cap"] if dex_data else 0.0
-            sym = (dex_data["symbol"] if dex_data else token_data["symbol"]).upper()
+            if dex_data:
+                mc = dex_data["market_cap"]
+                sym = dex_data["symbol"].upper()
 
-            SKIP_SYMBOLS = {"SOL", "USDC", "USDT", "BTC", "ETH", "BONK", "WIF", "JUP", "RAY", "BSC", "BASE", "BNB", "WBNB", "WETH", "WBTC", "DAI", "BUSD", "CAKE", "ETHEREUM", "UNISWAP", "UNI", "LINK", "AAVE", "MKR", "COMP", "SNX"}
-            if sym in SKIP_SYMBOLS or mc > 5_000_000:
-                ws_discovery_queue.task_done()
-                continue
-            if mc < 1_000 and dex_data:
-                ws_discovery_queue.task_done()
-                continue
+                if sym in _WS_ENRICH_SKIP_SYMBOLS or mc > 5_000_000:
+                    ws_discovery_queue.task_done()
+                    continue
+                if mc < 1_000:
+                    ws_discovery_queue.task_done()
+                    continue
 
-            async with tokens_lock:
-                real_launch = (dex_data.get("launched_at", 0.0) if dex_data else 0.0)
-                final_chain = (dex_data.get("chain_id") if dex_data else None) or ws_chain_id
-
-                if mint in tokens and tokens[mint].ws_pre_enrichment:
-                    # [v4.12] Upgrade the stub token with real DexScreener data.
-                    # Preserve trade counters that accumulated during the delay.
-                    t = tokens[mint]
-                    t.symbol = dex_data["symbol"] if dex_data else t.symbol
-                    t.name = dex_data["name"] if dex_data else t.name
-                    if real_launch:
-                        t.created_at = real_launch
-                        t.launched_at = real_launch
-                    t.market_cap = mc if mc else t.market_cap
-                    t.last_mc = t.market_cap
-                    t.volume_usd = dex_data["volume_usd"] if dex_data else t.volume_usd
-                    t.liquidity = dex_data["liquidity"] if dex_data else t.liquidity
-                    t.buy_ratio = dex_data.get("buy_ratio", t.buy_ratio) if dex_data else t.buy_ratio
-                    t.buys_h1 = dex_data.get("buys_h1", t.buys_h1) if dex_data else t.buys_h1
-                    t.sells_h1 = dex_data.get("sells_h1", t.sells_h1) if dex_data else t.sells_h1
-                    t.vol_history = [t.volume_usd] if t.volume_usd else t.vol_history
-                    t.chain_id = final_chain
-                    t.is_boosted = mint in boosted_mints
-                    t.ws_pre_enrichment = False  # fully enriched
-                    chain_label = get_chain(final_chain)["label"]
-                    logger.info(f"⚡ WS→Enriched [{chain_label}] ${sym} | MC: ${mc:,.0f} (stub upgraded)")
-
-                elif mint not in tokens:
-                    if not enforce_token_cap(sym):
-                        ws_discovery_queue.task_done()
-                        continue
-
-                    tokens[mint] = TokenInfo(
-                        mint=mint,
-                        symbol=dex_data["symbol"] if dex_data else token_data["symbol"],
-                        name=dex_data["name"] if dex_data else token_data["name"],
-                        created_at=real_launch if real_launch else token_data["created_at"],
-                        launched_at=real_launch,
-                        market_cap=mc,
-                        volume_usd=dex_data["volume_usd"] if dex_data else 0.0,
-                        liquidity=dex_data["liquidity"] if dex_data else 0.0,
-                        buy_ratio=dex_data.get("buy_ratio", 0.5) if dex_data else 0.5,
-                        buys_h1=dex_data.get("buys_h1", 0) if dex_data else 0,
-                        sells_h1=dex_data.get("sells_h1", 0) if dex_data else 0,
-                        last_mc=mc,
-                        is_boosted=mint in boosted_mints,
-                        vol_history=[dex_data["volume_usd"]] if dex_data else [],
-                        ws_discovered=True,
-                        ws_initial_buy_sol=token_data.get("ws_initial_buy_sol", 0.0),
-                        chain_id=final_chain,
-                    )
-                    chain_label = get_chain(final_chain)["label"]
-                    logger.info(f"⚡ WS→Tracked [{chain_label}] ${sym} | MC: ${mc:,.0f}")
+                await _finalize_ws_token(mint, token_data, ws_chain_id, dex_data, sym, mc)
+            else:
+                # [v4.26] Don't give up after one miss — DexScreener often just
+                # hasn't indexed the pair yet. Retry in the background instead
+                # of blocking this worker (which needs to keep draining the
+                # queue for every other in-flight discovery).
+                sym = token_data.get("symbol", "???").upper()
+                asyncio.create_task(_retry_ws_enrich(session, mint, token_data, ws_chain_id, sym))
 
             ws_discovery_queue.task_done()
 
