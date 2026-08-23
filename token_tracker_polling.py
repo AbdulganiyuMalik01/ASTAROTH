@@ -208,6 +208,79 @@ EVM_BASE_TOKENS = {
 WS_EVM_RECONNECT_DELAY_MIN = 2
 WS_EVM_RECONNECT_DELAY_MAX = 60
 
+# [v4.26] EVM push-based trade/volume feed. Mirrors the Solana WS trade model
+# (ws_buy_count/ws_sell_count/ws_buy_vol_usd/ws_sell_vol_usd on TokenInfo) —
+# those fields already exist and are already read by is_buy_vol_significant /
+# is_buy_vol_accelerating / the eth_vol_signal & eth_vol_accel alert paths, but
+# were dead code for EVM chains until now because nothing populated them.
+#
+# Approach: subscribe to Swap events (V2 and V3 event shapes) on the pair/pool
+# contracts of currently-tracked tokens, over the SAME Alchemy WS connection
+# used for pair discovery. Topic0 hashes verified two ways: computed locally
+# via keccak256 of the canonical event signatures, and cross-checked against
+# live BaseScan/PolygonScan/Arbiscan/OP-Etherscan transaction logs.
+_V2_SWAP_TOPIC = "0xd78ad95fa46c994b6551d0da85fc275fe613ce37657fb8d5e3d130840159d822"  # Swap(address,uint256,uint256,uint256,uint256,address)
+_V3_SWAP_TOPIC = "0xc42079f94a6350d7e6235f29174924f928cc2ac818eb64fed8004e115fbcca67"  # Swap(address,address,int256,int256,uint160,uint128,int24)
+
+EVM_MAX_SWAP_SUBS = int(os.getenv("EVM_MAX_SWAP_SUBS", "150"))  # cap on pairs subscribed per chain
+EVM_SWAP_RESUB_INTERVAL = 20  # seconds between subscription-list refreshes
+
+# Decimals for each known base/quote token, needed to turn a raw on-chain
+# integer swap amount into a real quantity. Wrapped-native tokens (WBNB/WETH)
+# are converted to USD via a static, env-overridable price constant — same
+# pattern already used for SOL (WS_SOL_PRICE_USD) — rather than a live oracle.
+WS_BNB_PRICE_USD = float(os.getenv("BNB_PRICE_USD", "600.0"))
+WS_ETH_PRICE_USD = float(os.getenv("ETH_PRICE_USD", "3000.0"))
+
+EVM_BASE_TOKEN_DECIMALS = {
+    "bsc": {
+        "0xbb4cdb9cbd36b01bd1cbaebf2de08d9173bc095c": 18,  # WBNB
+        "0x55d398326f99059ff775485246999027b3197955": 18,  # USDT (BSC-USD)
+        "0xe9e7cea3dedca5984780bafc599bd69add087d56": 18,  # BUSD
+        "0x8ac76a51cc950d9822d68b83fe1ad97b32cd580d": 18,  # USDC
+    },
+    "ethereum": {
+        "0xc02aaa39b223fe8d0a0e5c4f27ead9083c756cc2": 18,  # WETH
+        "0xdac17f958d2ee523a2206206994597c13d831ec7": 6,   # USDT
+        "0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48": 6,    # USDC
+    },
+    "base": {
+        "0x4200000000000000000000000000000000000006": 18,  # WETH
+        "0x833589fcd6edb6e08f4c7c32d4f71b54bda02913": 6,     # USDC
+    },
+}
+
+# Which base tokens are wrapped-native (priced via WS_*_PRICE_USD) vs
+# stablecoins (priced at a flat $1) — everything not listed here is a stable.
+_EVM_NATIVE_WRAPPED = {
+    "0xbb4cdb9cbd36b01bd1cbaebf2de08d9173bc095c": "bnb",   # WBNB
+    "0xc02aaa39b223fe8d0a0e5c4f27ead9083c756cc2": "eth",   # WETH (ethereum)
+    "0x4200000000000000000000000000000000000006": "eth",  # WETH (base)
+}
+
+
+def _evm_base_usd_price(base_addr: str) -> float:
+    kind = _EVM_NATIVE_WRAPPED.get(base_addr)
+    if kind == "bnb":
+        return WS_BNB_PRICE_USD
+    if kind == "eth":
+        return WS_ETH_PRICE_USD
+    return 1.0  # stablecoin side — flat $1 peg estimate
+
+
+def _evm_amount_to_usd(chain_id: str, base_addr: str, raw_amount: int) -> float:
+    decimals = EVM_BASE_TOKEN_DECIMALS.get(chain_id, {}).get(base_addr, 18)
+    qty = raw_amount / (10 ** decimals)
+    return qty * _evm_base_usd_price(base_addr)
+
+
+def _hex_word_to_signed_int(word_hex: str) -> int:
+    """Decode a 32-byte (64 hex char) word as a two's-complement signed int256."""
+    val = int(word_hex, 16)
+    if val >= (1 << 255):
+        val -= (1 << 256)
+    return val
+
 # [v4.9] Multi-chain support
 # Each chain: enabled, has_ws (PumpPortal for Solana, Alchemy for the rest —
 # only on if ALCHEMY_API_KEY is set), dexscreener chain id, explorer base url
@@ -331,8 +404,23 @@ TOKEN_STALE_AGE_SECONDS = 90 * 60
 TOKEN_STALE_VOL_THRESHOLD = 5_000
 TOKEN_PRUNE_INTERVAL = 300
 
+# [v4.26] Persistent storage directory. Railway's container filesystem is
+# ephemeral — anything written outside a mounted Volume is wiped on every
+# redeploy/restart. If you attach a Volume in the Railway dashboard, Railway
+# auto-injects RAILWAY_VOLUME_MOUNT_PATH pointing at it; state files then
+# survive redeploys automatically. With no Volume attached, this falls back to
+# the working directory (today's behavior — state resets on every deploy).
+_DATA_DIR = (os.getenv("RAILWAY_VOLUME_MOUNT_PATH", "").strip()
+             or os.getenv("DATA_DIR", "").strip()
+             or ".")
+if _DATA_DIR != "." and not os.path.isdir(_DATA_DIR):
+    try:
+        os.makedirs(_DATA_DIR, exist_ok=True)
+    except Exception:
+        _DATA_DIR = "."  # mount path not writable/available — fail open to cwd
+
 # v4.4 constants
-STATE_FILE = "astaroth_state.json"
+STATE_FILE = os.path.join(_DATA_DIR, "astaroth_state.json")
 ALERT_RATE_LIMIT = 30
 SNAPSHOT_INTERVAL = 15  # [fix] save more frequently — Railway redeploys are fast
 BOOST_POLL_INTERVAL = 120
@@ -343,7 +431,7 @@ WS_SYMBOL_COOLDOWN = 30        # seconds — ignore same symbol+buy fingerprint 
 WS_COOLDOWN_CLEANUP = 300      # clean up expired cooldown entries every 5 min
 
 # [v4.7] KOL social polling
-KOL_FILE = "kol_list.json"            # persisted KOL account list
+KOL_FILE = os.path.join(_DATA_DIR, "kol_list.json")  # persisted KOL account list
 KOL_POLL_INTERVAL = 120               # poll each KOL every 2 minutes
 KOL_POST_LOOKBACK = 300               # only consider posts from last 5 minutes
 KOL_ALERT_COOLDOWN = 600              # 10 min cooldown per KOL+ticker pair
@@ -372,10 +460,33 @@ _last_chain_poll: dict = {"ethereum": 0.0, "bsc": 0.0, "base": 0.0}
 # [v4.6] WS spam dedup: symbol -> list of (timestamp, mint) tuples seen within cooldown window
 # Used to detect squatter swarms (many different mints sharing the same ticker in a short burst).
 ws_symbol_cooldown: Dict[str, list] = {}
+
+# [v4.26] symbol -> lockout expiry timestamp. Set once a symbol trips the swarm
+# threshold; any new mint for that exact symbol is dropped outright until this
+# expires, regardless of the (much shorter) burst-detection window above.
+ws_symbol_lockout: Dict[str, float] = {}
+
+# [v4.26] symbol -> {"mint", "chain_id", "alerted_at"} for the most recent token
+# that actually alerted under that ticker. Used to block later same-symbol mints
+# from being tracked as squats on an already-proven gem.
+alerted_symbol_registry: Dict[str, dict] = {}
 ws_sub_request_queue: asyncio.Queue = None  # [fix] side-channel for trade sub requests
 
 # How many distinct mints for the same symbol in WS_SYMBOL_COOLDOWN seconds = squatter swarm
 WS_SQUATTER_THRESHOLD = 4
+
+# [v4.26] Extended squatter lockout. The original burst window (WS_SYMBOL_COOLDOWN,
+# 30s) resets itself — a squatter swarm that drips mints in slightly slower than
+# 30s apart never re-triggers the threshold and slips through indefinitely. Once a
+# symbol trips the swarm threshold, lock it out for a much longer window instead of
+# only during the triggering burst.
+WS_SYMBOL_LOCKOUT_SECONDS = int(os.getenv("WS_SYMBOL_LOCKOUT_SECONDS", "900"))  # 15 min
+
+# [v4.26] Guard against copycats of a symbol that already produced a REAL alerted
+# gem. Once $TICKER passes every threshold and alerts, any other distinct mint
+# reusing that exact ticker within this window is almost always a clone trying to
+# ride the original's momentum/search traffic — block it from ever being tracked.
+ALERTED_SYMBOL_GUARD_SECONDS = int(os.getenv("ALERTED_SYMBOL_GUARD_SECONDS", "3600"))  # 1 hour
 
 # [v4.7] KOL state
 kol_accounts: Dict[str, dict] = {}    # handle -> {added_at, last_polled, post_ids_seen}
@@ -393,9 +504,20 @@ ws_stats = {
 
 # [v4.25] Alchemy WS stats — one entry per EVM chain with has_ws enabled
 evm_ws_stats: Dict[str, dict] = {
-    cid: {"connected": False, "reconnects": 0, "pairs_discovered": 0, "last_message_at": 0.0}
+    cid: {"connected": False, "reconnects": 0, "pairs_discovered": 0, "last_message_at": 0.0,
+          "trades_received": 0, "swap_subs": 0}
     for cid in ("bsc", "base", "ethereum")
 }
+
+# [v4.26] EVM swap/volume feed state — per chain.
+# pair_address(lower) -> {"mint", "base_token", "base_is_token0", "dex"}
+evm_pair_meta: Dict[str, Dict[str, dict]] = {cid: {} for cid in ("bsc", "base", "ethereum")}
+# pair addresses currently included in the live Swap-event subscription
+evm_swap_subscribed: Dict[str, Set[str]] = {cid: set() for cid in ("bsc", "base", "ethereum")}
+# JSON-RPC subscription id returned by Alchemy for the swap-logs filter (needed
+# to route incoming eth_subscription pushes and to eth_unsubscribe on refresh)
+evm_swap_sub_id: Dict[str, Optional[str]] = {cid: None for cid in ("bsc", "base", "ethereum")}
+evm_factory_sub_id: Dict[str, Optional[str]] = {cid: None for cid in ("bsc", "base", "ethereum")}
 
 # [v4.5] Queue for WS-discovered tokens needing DexScreener enrichment
 ws_discovery_queue: asyncio.Queue = None
@@ -577,6 +699,15 @@ async def save_state():
 
 def load_state():
     global seen_mints
+    if _DATA_DIR == ".":
+        logger.warning(
+            "⚠️ No Railway Volume detected (RAILWAY_VOLUME_MOUNT_PATH unset) — "
+            "state/KOL files live on the ephemeral container disk and WILL be "
+            "wiped on the next redeploy. Attach a Volume in the Railway dashboard "
+            "to persist across deploys."
+        )
+    else:
+        logger.info(f"💾 Persistent storage active — state/KOL files saved to {_DATA_DIR}")
     if not os.path.exists(STATE_FILE):
         logger.info("📂 No saved state — starting fresh")
         return
@@ -651,6 +782,18 @@ async def prune_dead_tokens():
         if expired_syms:
             logger.debug(f"🧹 Cleared {len(expired_syms)} WS cooldown symbol entries")
 
+        # [v4.26] Clear expired lockouts and stale alerted-symbol guard entries
+        expired_locks = [s for s, exp in ws_symbol_lockout.items() if exp <= now]
+        for s in expired_locks:
+            del ws_symbol_lockout[s]
+
+        guard_cutoff = now - ALERTED_SYMBOL_GUARD_SECONDS
+        expired_guards = [
+            s for s, g in alerted_symbol_registry.items() if g["alerted_at"] <= guard_cutoff
+        ]
+        for s in expired_guards:
+            del alerted_symbol_registry[s]
+
     to_remove = []
     async with tokens_lock:
         for mint, token in tokens.items():
@@ -669,6 +812,14 @@ async def prune_dead_tokens():
         sample = ", ".join(f"${s}" for _, s, _ in to_remove[:5])
         suffix = "..." if len(to_remove) > 5 else ""
         logger.info(f"🗑️ Pruned {len(to_remove)} dead tokens ({sample}{suffix}) | Pool: {len(tokens)}")
+
+        # [v4.26] Drop evm_pair_meta entries for pruned tokens too, else the
+        # swap-feed metadata dict grows unbounded over long uptimes.
+        pruned_mints = {mint for mint, _, _ in to_remove}
+        for cid_meta in evm_pair_meta.values():
+            stale_pairs = [p for p, info in cid_meta.items() if info["mint"] in pruned_mints]
+            for p in stale_pairs:
+                del cid_meta[p]
 
 
 def enforce_token_cap(symbol: str) -> bool:
@@ -1368,6 +1519,27 @@ async def _handle_ws_create(data: dict):
     # window = coordinated symbol-squatting attack. Track (timestamp, mint) pairs per symbol.
     sym_key = symbol.upper().strip()
     now = time.time()
+
+    # [v4.26] Hard lockout — if this symbol already tripped the swarm threshold
+    # recently, keep blocking it for the full lockout window even though the
+    # original 30s burst window has long since rolled over.
+    lock_until = ws_symbol_lockout.get(sym_key, 0.0)
+    if lock_until > now:
+        logger.debug(f"🚫 WS squat-locked: ${symbol} ({int(lock_until - now)}s left)")
+        return
+
+    # [v4.26] Copycat-of-a-winner guard — a different mint reusing the exact
+    # ticker of a token that already alerted as a real gem is almost always a
+    # clone riding the original's momentum, not a coincidence.
+    guard = alerted_symbol_registry.get(sym_key)
+    if guard and guard["mint"] != mint and (now - guard["alerted_at"]) < ALERTED_SYMBOL_GUARD_SECONDS:
+        remaining = int(ALERTED_SYMBOL_GUARD_SECONDS - (now - guard["alerted_at"]))
+        logger.debug(
+            f"🚫 WS squat-on-winner: ${symbol} — new mint reuses a ticker that "
+            f"already alerted ({guard['mint'][:8]}…), {remaining}s guard left"
+        )
+        return
+
     cutoff = now - WS_SYMBOL_COOLDOWN
     existing = ws_symbol_cooldown.get(sym_key, [])
     # Prune stale entries
@@ -1375,8 +1547,10 @@ async def _handle_ws_create(data: dict):
     existing.append((now, mint))
     ws_symbol_cooldown[sym_key] = existing
     if len(existing) > WS_SQUATTER_THRESHOLD:
+        ws_symbol_lockout[sym_key] = now + WS_SYMBOL_LOCKOUT_SECONDS
         logger.debug(
-            f"🚫 WS squatter swarm: ${symbol} — {len(existing)} mints in {WS_SYMBOL_COOLDOWN}s"
+            f"🚫 WS squatter swarm: ${symbol} — {len(existing)} mints in {WS_SYMBOL_COOLDOWN}s "
+            f"(locking ${symbol} for {WS_SYMBOL_LOCKOUT_SECONDS}s)"
         )
         return
 
@@ -1575,16 +1749,145 @@ def _topic_to_address(topic_hex: str) -> str:
     return "0x" + topic_hex[-40:]
 
 
+def _log_data_words(log: dict) -> List[str]:
+    """Split a log's non-indexed `data` field into its 32-byte (64 hex char) words."""
+    data_hex = (log.get("data") or "0x")[2:]
+    return [data_hex[i:i + 64] for i in range(0, len(data_hex), 64)]
+
+
+async def _handle_evm_swap_log(chain_id: str, log: dict) -> None:
+    """
+    Decode a Swap event (V2 In/Out style or V3 signed-delta style) on a pair
+    we recorded metadata for at discovery time, and credit the buy/sell volume
+    onto the matching tracked token — same fields the Solana WS trade handler
+    populates (ws_buy_count/ws_sell_count/ws_buy_vol_usd/ws_sell_vol_usd),
+    which is what activates the existing eth_vol_signal/eth_vol_accel alert
+    paths for EVM chains.
+    """
+    pair_addr = (log.get("address") or "").lower()
+    meta = evm_pair_meta[chain_id].get(pair_addr)
+    if not meta:
+        return
+    mint = meta["mint"]
+    if mint not in tokens:
+        return
+
+    topics = log.get("topics", [])
+    if not topics:
+        return
+    topic0 = topics[0].lower()
+    words = _log_data_words(log)
+
+    try:
+        if topic0 == _V2_SWAP_TOPIC and len(words) >= 4:
+            amount0_in = int(words[0], 16)
+            amount1_in = int(words[1], 16)
+            amount0_out = int(words[2], 16)
+            amount1_out = int(words[3], 16)
+            if meta["base_is_token0"]:
+                base_in, base_out = amount0_in, amount0_out
+            else:
+                base_in, base_out = amount1_in, amount1_out
+            is_buy = base_in > 0
+            base_raw = base_in if is_buy else base_out
+        elif topic0 == _V3_SWAP_TOPIC and len(words) >= 2:
+            amount0 = _hex_word_to_signed_int(words[0])
+            amount1 = _hex_word_to_signed_int(words[1])
+            base_delta = amount0 if meta["base_is_token0"] else amount1
+            is_buy = base_delta > 0
+            base_raw = abs(base_delta)
+        else:
+            return
+    except (ValueError, IndexError):
+        return
+
+    if base_raw <= 0:
+        return
+
+    usd_amount = _evm_amount_to_usd(chain_id, meta["base_token"], base_raw)
+    if usd_amount <= 0:
+        return
+
+    evm_ws_stats[chain_id]["trades_received"] += 1
+
+    async with tokens_lock:
+        t = tokens.get(mint)
+        if not t:
+            return
+        if is_buy:
+            t.ws_buy_count += 1
+            t.ws_buy_vol_usd += usd_amount
+        else:
+            t.ws_sell_count += 1
+            t.ws_sell_vol_usd += usd_amount
+
+
+async def _refresh_evm_swap_subs(ws, chain_id: str) -> None:
+    """
+    Background loop (one per active connection): periodically rebuild the
+    Swap-event subscription's address list from whichever discovered pairs
+    currently have a live tracked token, capped at EVM_MAX_SWAP_SUBS. Alchemy's
+    eth_subscribe has no "add address" call — refreshing means unsubscribing
+    the old filter and subscribing a new one with the full address list.
+    """
+    while True:
+        await asyncio.sleep(EVM_SWAP_RESUB_INTERVAL)
+        try:
+            meta = evm_pair_meta[chain_id]
+            if not meta:
+                continue
+            candidates = [pair for pair, info in meta.items() if info["mint"] in tokens][:EVM_MAX_SWAP_SUBS]
+            candidate_set = set(candidates)
+            if candidate_set == evm_swap_subscribed[chain_id]:
+                continue  # nothing changed — skip the resubscribe round-trip
+
+            old_sub_id = evm_swap_sub_id.get(chain_id)
+            if old_sub_id:
+                await ws.send(json.dumps({
+                    "jsonrpc": "2.0", "id": 8, "method": "eth_unsubscribe", "params": [old_sub_id],
+                }))
+
+            if not candidates:
+                evm_swap_subscribed[chain_id] = set()
+                evm_swap_sub_id[chain_id] = None
+                evm_ws_stats[chain_id]["swap_subs"] = 0
+                continue
+
+            await ws.send(json.dumps({
+                "jsonrpc": "2.0", "id": 2, "method": "eth_subscribe",
+                "params": ["logs", {"address": candidates, "topics": [[_V2_SWAP_TOPIC, _V3_SWAP_TOPIC]]}],
+            }))
+            evm_swap_subscribed[chain_id] = candidate_set
+            evm_ws_stats[chain_id]["swap_subs"] = len(candidate_set)
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            logger.debug(f"EVM swap resub error [{chain_id}]: {e}")
+
+
 async def evm_ws_listener(chain_id: str):
     """
-    Push-based new-pair discovery for an EVM chain via Alchemy WS.
+    Push-based new-pair discovery AND live trade/volume feed for an EVM chain
+    via Alchemy WS, multiplexed over one connection.
 
-    Subscribes to eth_subscribe/logs for the chain's known DEX factory
-    contracts (PairCreated for V2-style, PoolCreated for V3-style), decodes
-    the newly-listed token address out of the log's indexed topics, and feeds
-    it into the same ws_discovery_queue the Solana WS path uses — enrichment
+    Subscription 1 (factory logs, request id 1): PairCreated (V2-style) /
+    PoolCreated (V3-style) on the chain's known DEX factories. Decodes the
+    newly-listed token address out of the log's indexed topics and feeds it
+    into the same ws_discovery_queue the Solana WS path uses — enrichment
     (get_dex_data, threshold checks, TokenInfo creation) is already
-    chain-agnostic, so no changes are needed downstream.
+    chain-agnostic. Also records the pair/pool address + which side is the
+    base token, so subscription 2 can attribute swaps correctly.
+
+    Subscription 2 (swap logs, request id 2, refreshed by
+    _refresh_evm_swap_subs): Swap events on the pairs of currently-tracked
+    tokens. Credits buy/sell volume onto ws_buy_count/ws_sell_count/
+    ws_buy_vol_usd/ws_sell_vol_usd — the same TokenInfo fields the Solana WS
+    trade handler populates, activating the existing eth_vol_signal /
+    eth_vol_accel alert paths for EVM chains for the first time.
+
+    Both subscriptions arrive as eth_subscription pushes on the same socket,
+    distinguished by their "subscription" id — routed via evm_factory_sub_id /
+    evm_swap_sub_id, captured from each subscribe call's ack.
 
     No-ops (logs once, returns) if ALCHEMY_API_KEY isn't set or this chain has
     no configured factories — the existing DexScreener poll loop keeps running
@@ -1602,6 +1905,7 @@ async def evm_ws_listener(chain_id: str):
     addresses = [f["address"] for f in factories]
     topics = list({f["topic"] for f in factories})  # OR'd within this topic slot
     base_tokens = EVM_BASE_TOKENS.get(chain_id, set())
+    base_token_decimals = EVM_BASE_TOKEN_DECIMALS.get(chain_id, {})
     dex_by_topic = {f["topic"]: f["dex"] for f in factories}
 
     delay = WS_EVM_RECONNECT_DELAY_MIN
@@ -1609,6 +1913,7 @@ async def evm_ws_listener(chain_id: str):
     chain_label = get_chain(chain_id)["label"]
 
     while True:
+        resub_task = None
         try:
             logger.info(f"🔌 Connecting to Alchemy WS [{chain_label}]")
             async with websockets.connect(
@@ -1622,6 +1927,12 @@ async def evm_ws_listener(chain_id: str):
                 delay = WS_EVM_RECONNECT_DELAY_MIN
                 logger.info(f"✅ Alchemy WS connected [{chain_label}]")
 
+                # Fresh connection = fresh subscription ids; a stale swap
+                # filter from a previous connection no longer exists server-side.
+                evm_swap_subscribed[chain_id] = set()
+                evm_swap_sub_id[chain_id] = None
+                evm_factory_sub_id[chain_id] = None
+
                 await ws.send(json.dumps({
                     "jsonrpc": "2.0",
                     "id": 1,
@@ -1629,17 +1940,31 @@ async def evm_ws_listener(chain_id: str):
                     "params": ["logs", {"address": addresses, "topics": [topics]}],
                 }))
 
+                resub_task = asyncio.create_task(_refresh_evm_swap_subs(ws, chain_id))
+
                 async for message in ws:
                     try:
                         data = json.loads(message)
                         stats["last_message_at"] = time.time()
 
-                        # Subscription ack: {"id":1,"result":"0x..."} — nothing to do
+                        # Subscription ack: {"id":N,"result":"0x..."}
                         if "result" in data and "params" not in data:
+                            req_id = data.get("id")
+                            if req_id == 1:
+                                evm_factory_sub_id[chain_id] = data["result"]
+                            elif req_id == 2:
+                                evm_swap_sub_id[chain_id] = data["result"]
                             continue
 
-                        log = data.get("params", {}).get("result")
+                        params = data.get("params") or {}
+                        log = params.get("result")
                         if not log:
+                            continue
+
+                        # Route by subscription id — swap feed vs factory feed
+                        sub_id = params.get("subscription")
+                        if sub_id is not None and sub_id == evm_swap_sub_id.get(chain_id):
+                            await _handle_evm_swap_log(chain_id, log)
                             continue
 
                         log_topics = log.get("topics", [])
@@ -1652,11 +1977,11 @@ async def evm_ws_listener(chain_id: str):
                         token1 = _topic_to_address(log_topics[2]).lower()
 
                         if token0 in base_tokens and token1 not in base_tokens:
-                            new_token = token1
+                            new_token, base_token_addr = token1, token0
                         elif token1 in base_tokens and token0 not in base_tokens:
-                            new_token = token0
+                            new_token, base_token_addr = token0, token1
                         elif token0 not in base_tokens and token1 not in base_tokens:
-                            new_token = token0  # neither side recognized — best effort
+                            new_token, base_token_addr = token0, token1  # neither side recognized — best effort
                         else:
                             continue  # both sides are base tokens (e.g. USDC/WETH) — not a new listing
 
@@ -1665,6 +1990,23 @@ async def evm_ws_listener(chain_id: str):
                         seen_mints.add(new_token)
                         stats["pairs_discovered"] += 1
                         logger.info(f"⚡ WS NEW [{chain_label}/{dex_name}]: {new_token[:10]}...")
+
+                        # Record pair metadata (needed by the swap feed) only when
+                        # we recognize the base-token side well enough to price it.
+                        if base_token_addr in base_token_decimals:
+                            words = _log_data_words(log)
+                            pair_addr = None
+                            if topic0 == _PAIR_CREATED_TOPIC and words:
+                                pair_addr = "0x" + words[0][-40:]
+                            elif topic0 == _POOL_CREATED_TOPIC and len(words) >= 2:
+                                pair_addr = "0x" + words[1][-40:]
+                            if pair_addr:
+                                evm_pair_meta[chain_id][pair_addr] = {
+                                    "mint": new_token,
+                                    "base_token": base_token_addr,
+                                    "base_is_token0": base_token_addr == token0,
+                                    "dex": dex_name,
+                                }
 
                         if ws_discovery_queue is not None:
                             await ws_discovery_queue.put({
@@ -1699,6 +2041,13 @@ async def evm_ws_listener(chain_id: str):
             logger.warning(f"🔌 Alchemy WS [{chain_label}] disconnected: {e}{hint} — reconnecting in {delay}s")
             await asyncio.sleep(delay)
             delay = min(delay * 2, WS_EVM_RECONNECT_DELAY_MAX)
+        finally:
+            if resub_task is not None:
+                resub_task.cancel()
+                try:
+                    await resub_task
+                except (asyncio.CancelledError, Exception):
+                    pass
 
 # ============================================================================
 # DexScreener Enrichment
@@ -2483,6 +2832,11 @@ async def run_detections(token: TokenInfo, session: aiohttp.ClientSession = None
             token.alerted = True
             token.last_alerted = now
             token.alert_mc = mc
+            # [v4.26] Record this as the "winner" for its ticker so later mints
+            # reusing the exact same symbol get caught by the squat-on-winner guard.
+            alerted_symbol_registry[token.symbol.upper().strip()] = {
+                "mint": token.mint, "chain_id": token.chain_id, "alerted_at": now,
+            }
             msg_id = await _send_telegram_direct(format_gem_alert(token, alert_reason, distro))
             if msg_id:
                 token.alert_message_id = msg_id  # store for reply-threading
@@ -3127,6 +3481,10 @@ async def status():
         "gems_alerted": sum(1 for t in tokens.values() if t.alerted),
         "ws": ws_stats,
         "evm_ws": {cid: s for cid, s in evm_ws_stats.items() if get_chain(cid)["has_ws"]},
+        "squat_guard": {
+            "locked_symbols": len(ws_symbol_lockout),
+            "guarded_winners": len(alerted_symbol_registry),
+        },
         "alert_queue": _alert_queue.qsize() if _alert_queue else 0,
         "mode": "websocket+polling",
         "runner_detection": _RUNNER_DETECTOR_AVAILABLE,

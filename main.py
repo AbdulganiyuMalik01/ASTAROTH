@@ -1,3 +1,19 @@
+"""
+⚠️ NOT PART OF THE DEPLOYED SERVICE.
+
+This is the entrypoint for an older, standalone Telegram bot prototype
+(QuantAgentBot in agent/bot.py). Railway runs token_tracker_polling.py
+directly (see Procfile / railway.toml / nixpacks.toml) — nothing invokes
+this file in production, and it has not been deployed since the deploy
+stack was rebuilt around token_tracker_polling.py.
+
+It also duplicates KOL/influencer tracking: this stack uses a hardcoded
+KOL_ACCOUNTS list (utils/kol_accounts.py) feeding SignalAggregator/
+NarrativeDetector, completely separate from token_tracker_polling.py's
+live kol_polling_loop() (Nitter/RapidAPI + kol_list.json). See
+LEGACY_STANDALONE_BOT.md at the repo root for the full history and what
+to do about it.
+"""
 import logging
 import os
 from dotenv import load_dotenv

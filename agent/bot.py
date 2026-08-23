@@ -1,3 +1,10 @@
+# ⚠️ NOT PART OF THE DEPLOYED SERVICE — see LEGACY_STANDALONE_BOT.md at the
+# repo root. Railway only ever runs token_tracker_polling.py (Procfile /
+# railway.toml / nixpacks.toml); this class is never instantiated in
+# production. Its KOL_ACCOUNTS-driven tracking below is a separate,
+# unused implementation of the same idea as token_tracker_polling.py's live
+# kol_polling_loop() — don't extend KOL logic here expecting it to affect
+# the running bot.
 import asyncio
 import logging
 import os
