@@ -64,6 +64,7 @@ load_dotenv()
 
 from config import get_config
 from webhook_security import RateLimiter
+import database as alert_db
 
 # Optional runner detector
 _RUNNER_DETECTOR_AVAILABLE = False
@@ -3361,6 +3362,17 @@ async def run_detections(token: TokenInfo, session: aiohttp.ClientSession = None
                 "ws_sells": token.ws_sell_count, "signal": alert_reason,
                 "alerted": True, "skip": "",
             })
+            # [v4.31] Durable copy in the SQLite alert-history log — unlike
+            # _analysis_ring (capped, resets on restart) this survives restarts
+            # and is queryable via /db/alerts. Fire-and-forget: a slow/failed
+            # disk write must never delay the alert path that triggered it.
+            asyncio.create_task(alert_db.log_alert_async({
+                "mint": token.mint, "symbol": token.symbol, "chain_id": token.chain_id,
+                "alert_reason": alert_reason, "alerted_at": now, "market_cap": mc,
+                "volume_usd": vol, "liquidity": liq, "buy_ratio": token.buy_ratio,
+                "buys_h1": token.buys_h1, "ws_discovered": token.ws_discovered,
+                "age_seconds": age_s,
+            }))
             return
 
         # [v4.12] No detection path fired — record near-miss for /analysis visibility
@@ -3901,6 +3913,7 @@ async def lifespan(app: FastAPI):
     logger.info(f"📡 Fallback poll: {POLL_INTERVAL}s | Cap: {MAX_TRACKED_TOKENS} | Alert gap: {ALERT_RATE_LIMIT}s")
 
     load_state()
+    alert_db.init_db(_DATA_DIR)  # [v4.31] SQLite alert-history log — additive, never blocks startup on failure
     await init_telegram()
 
     _alert_queue = asyncio.Queue(maxsize=50)
@@ -4025,6 +4038,26 @@ async def status():
 @app.get("/dashboard", response_class=HTMLResponse)
 async def dashboard():
     return build_dashboard_html()
+
+
+@app.get("/db/alerts")
+async def db_alerts(limit: int = 50, chain: str = "", symbol: str = ""):
+    """
+    [v4.31] Durable alert history from the SQLite log — unlike /analysis this
+    survives restarts and isn't capped at 500. Query params:
+      - limit: how many rows to return (default 50, max 500)
+      - chain: filter by chain_id (e.g. 'bsc', 'ethereum')
+      - symbol: filter by exact ticker (case-insensitive)
+    """
+    rows = await alert_db.query_alerts_async(limit=limit, chain_id=chain or None, symbol=symbol or None)
+    return {"count": len(rows), "alerts": rows}
+
+
+@app.get("/db/stats")
+async def db_stats():
+    """[v4.31] Aggregate counts from the alert-history DB: total alerts, broken
+    down by chain and by alert path (GEM/FAST/EARLY/VOL/VACCEL)."""
+    return await alert_db.get_stats_async()
 
 
 @app.get("/analysis")
