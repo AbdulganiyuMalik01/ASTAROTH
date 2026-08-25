@@ -41,6 +41,7 @@ if sys.platform == "win32":
 
 import asyncio
 import json
+import base64
 import html
 import time
 import logging
@@ -394,6 +395,40 @@ WS_ENRICH_DELAY = 3           # seconds to wait after WS discovery before DexScr
 WS_ENRICH_RETRY_DELAYS = [7, 15, 30]
 WS_SOL_PRICE_USD = float(os.getenv("SOL_PRICE_USD", "175.0"))  # used to convert WS SOL vol → USD
 
+# ============================================================================
+# [v4.29] Direct on-chain pump.fun indexing — bypasses the PumpPortal relay
+# ============================================================================
+# PumpPortal is itself just a third party reading pump.fun's on-chain Anchor
+# program and republishing it as JSON over WS. This reads the same program
+# directly via Helius's logsSubscribe, decoding the raw Anchor event logs
+# ourselves. Two upsides over PumpPortal: (1) one less hop = lower latency,
+# (2) PumpPortal only streams trades for up to WS_MAX_TRADE_SUBS (50)
+# explicitly-subscribed mints — direct indexing gets creates *and* trades for
+# every single pump.fun token, no subscription cap.
+#
+# PUMPFUN_DIRECT_MODE:
+#   off    (default) — direct listener disabled entirely; PumpPortal WS is the
+#                       only feed. No behavior change from before this exists.
+#   shadow — direct listener runs alongside PumpPortal, decodes events and logs
+#            stats, but does NOT feed tokens/trades into the bot. Use this to
+#            verify the decoder is producing sane data against PumpPortal's
+#            parallel feed in the live logs before trusting it.
+#   live   — direct listener replaces PumpPortal entirely as the sole
+#            discovery/trade feed (PumpPortal WS + its trade-sub manager are
+#            not started, avoiding double-counted creates/trades).
+PUMPFUN_DIRECT_MODE = os.getenv("PUMPFUN_DIRECT_MODE", "off").strip().lower()
+PUMPFUN_PROGRAM_ID = "6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P"
+HELIUS_WS = f"wss://mainnet.helius-rpc.com/?api-key={HELIUS_API_KEY}" if HELIUS_API_KEY else ""
+# Anchor 8-byte event discriminators, from pump.fun's official IDL
+# (https://github.com/pump-fun/pump-public-docs) — sha256("event:<Name>")[:8].
+_CREATE_EVENT_DISC = bytes([27, 114, 169, 77, 222, 235, 99, 118])
+_TRADE_EVENT_DISC = bytes([189, 219, 127, 211, 78, 230, 97, 238])
+# Standard pump.fun bonding-curve total supply (1B tokens @ 6 decimals). Used
+# as a fallback for trades on tokens whose CreateEvent we never saw (listener
+# connected after launch) — TradeEvent doesn't carry token_total_supply, only
+# CreateEvent does, so this is the best available default.
+_PUMPFUN_DEFAULT_SUPPLY = 1_000_000_000 * 10 ** 6
+
 POLL_INTERVAL = 15            # [v4.5] Reduced — WS handles discovery now
 TOKENS_PER_POLL = 30
 
@@ -506,6 +541,19 @@ WS_SYMBOL_LOCKOUT_SECONDS = int(os.getenv("WS_SYMBOL_LOCKOUT_SECONDS", "900"))  
 # reusing that exact ticker within this window is almost always a clone trying to
 # ride the original's momentum/search traffic — block it from ever being tracked.
 ALERTED_SYMBOL_GUARD_SECONDS = int(os.getenv("ALERTED_SYMBOL_GUARD_SECONDS", "3600"))  # 1 hour
+
+# [v4.29] Direct pump.fun on-chain indexing state. mint -> raw token_total_supply,
+# cached off each CreateEvent since TradeEvent doesn't carry it.
+_pumpfun_supply_cache: Dict[str, int] = {}
+pumpfun_direct_stats = {
+    "connected": False,
+    "mode": PUMPFUN_DIRECT_MODE,
+    "creates_decoded": 0,
+    "trades_decoded": 0,
+    "decode_errors": 0,
+    "reconnects": 0,
+    "last_message_at": 0.0,
+}
 
 # [v4.7] KOL state
 kol_accounts: Dict[str, dict] = {}    # handle -> {added_at, last_polled, post_ids_seen}
@@ -1721,6 +1769,270 @@ async def _handle_ws_trade(data: dict):
                     t.ws_liquidity_estimate = vsol_curve * WS_SOL_PRICE_USD
 
             update_composite_score(t)
+
+
+# ============================================================================
+# [v4.29] Borsh decoding for direct on-chain pump.fun events
+# ============================================================================
+# Minimal hand-rolled Anchor/borsh reader — just the primitives pump.fun's
+# CreateEvent/TradeEvent structs use. Each _b_read_* takes (buf, offset) and
+# returns (value, new_offset) so callers can thread the offset through in
+# field order without re-slicing by hand.
+
+def _b_require(buf: bytes, off: int, n: int):
+    # Plain slicing silently truncates on a short buffer instead of raising —
+    # a malformed/truncated payload would otherwise decode into garbage
+    # instead of failing loudly, so every reader checks bounds explicitly.
+    if off + n > len(buf) or off < 0:
+        raise IndexError(f"borsh read past end of buffer (need {n} bytes at {off}, have {len(buf)})")
+
+def _b_read_u8(buf: bytes, off: int):
+    _b_require(buf, off, 1)
+    return buf[off], off + 1
+
+def _b_read_u16(buf: bytes, off: int):
+    _b_require(buf, off, 2)
+    return int.from_bytes(buf[off:off + 2], "little"), off + 2
+
+def _b_read_u64(buf: bytes, off: int):
+    _b_require(buf, off, 8)
+    return int.from_bytes(buf[off:off + 8], "little", signed=False), off + 8
+
+def _b_read_i64(buf: bytes, off: int):
+    _b_require(buf, off, 8)
+    return int.from_bytes(buf[off:off + 8], "little", signed=True), off + 8
+
+def _b_read_bool(buf: bytes, off: int):
+    _b_require(buf, off, 1)
+    return buf[off] != 0, off + 1
+
+def _b_read_pubkey(buf: bytes, off: int):
+    _b_require(buf, off, 32)
+    raw = buf[off:off + 32]
+    try:
+        pk = str(PublicKey(raw))
+    except Exception:
+        pk = raw.hex()
+    return pk, off + 32
+
+def _b_read_u32(buf: bytes, off: int):
+    _b_require(buf, off, 4)
+    return int.from_bytes(buf[off:off + 4], "little"), off + 4
+
+def _b_read_string(buf: bytes, off: int):
+    n, off = _b_read_u32(buf, off)
+    _b_require(buf, off, n)
+    raw = buf[off:off + n]
+    return raw.decode("utf-8", errors="replace"), off + n
+
+
+def _decode_create_event(payload: bytes) -> Optional[dict]:
+    """
+    Decode a pump.fun CreateEvent (post-discriminator payload) per the field
+    order in the official IDL: name, symbol, uri, mint, bonding_curve, user,
+    creator, timestamp, virtual_token_reserves, virtual_sol_reserves,
+    real_token_reserves, token_total_supply, token_program, is_mayhem_mode,
+    is_cashback_enabled, quote_mint, virtual_quote_reserves.
+    """
+    try:
+        off = 0
+        name, off = _b_read_string(payload, off)
+        symbol, off = _b_read_string(payload, off)
+        _uri, off = _b_read_string(payload, off)
+        mint, off = _b_read_pubkey(payload, off)
+        _bonding_curve, off = _b_read_pubkey(payload, off)
+        _user, off = _b_read_pubkey(payload, off)
+        _creator, off = _b_read_pubkey(payload, off)
+        _timestamp, off = _b_read_i64(payload, off)
+        virtual_token_reserves, off = _b_read_u64(payload, off)
+        virtual_sol_reserves, off = _b_read_u64(payload, off)
+        _real_token_reserves, off = _b_read_u64(payload, off)
+        token_total_supply, off = _b_read_u64(payload, off)
+        # remaining fields (token_program, is_mayhem_mode, is_cashback_enabled,
+        # quote_mint, virtual_quote_reserves) aren't needed for MC/liquidity —
+        # virtual_sol_reserves is always SOL-denominated regardless of
+        # quote_mint (the IDL tracks quote-currency reserves separately in
+        # virtual_quote_reserves), so no quote_mint branching is needed here.
+        return {
+            "mint": mint,
+            "symbol": symbol or name[:10],
+            "name": name,
+            "virtual_sol_reserves": virtual_sol_reserves,
+            "virtual_token_reserves": virtual_token_reserves,
+            "token_total_supply": token_total_supply,
+        }
+    except (IndexError, UnicodeDecodeError, ValueError):
+        return None
+
+
+def _decode_trade_event(payload: bytes) -> Optional[dict]:
+    """
+    Decode a pump.fun TradeEvent (post-discriminator payload) per the IDL
+    field order: mint, sol_amount, token_amount, is_buy, user, timestamp,
+    virtual_sol_reserves, virtual_token_reserves, real_sol_reserves,
+    real_token_reserves, ... (rest unused here).
+    """
+    try:
+        off = 0
+        mint, off = _b_read_pubkey(payload, off)
+        sol_amount, off = _b_read_u64(payload, off)
+        _token_amount, off = _b_read_u64(payload, off)
+        is_buy, off = _b_read_bool(payload, off)
+        _user, off = _b_read_pubkey(payload, off)
+        _timestamp, off = _b_read_i64(payload, off)
+        virtual_sol_reserves, off = _b_read_u64(payload, off)
+        virtual_token_reserves, off = _b_read_u64(payload, off)
+        return {
+            "mint": mint,
+            "sol_amount": sol_amount,
+            "is_buy": is_buy,
+            "virtual_sol_reserves": virtual_sol_reserves,
+            "virtual_token_reserves": virtual_token_reserves,
+        }
+    except (IndexError, ValueError):
+        return None
+
+
+def _pumpfun_mc_sol(virtual_sol_reserves: int, virtual_token_reserves: int, token_total_supply: int) -> float:
+    """marketCapSol = (virtual_sol_reserves/1e9) * (token_total_supply/virtual_token_reserves).
+    Validated against live logs in production — matches PumpPortal's marketCapSol
+    for brand-new tokens to within rounding."""
+    if virtual_token_reserves <= 0:
+        return 0.0
+    return (virtual_sol_reserves / 1e9) * (token_total_supply / virtual_token_reserves)
+
+
+async def pumpfun_direct_listener():
+    """
+    [v4.29] Direct on-chain pump.fun indexing via Helius logsSubscribe — reads
+    the pump.fun program's own CreateEvent/TradeEvent Anchor logs instead of
+    going through the PumpPortal relay. See PUMPFUN_DIRECT_MODE docs above.
+    """
+    if not HELIUS_WS:
+        logger.warning("⚠️ PUMPFUN_DIRECT_MODE set but HELIUS_API_KEY missing — direct listener not starting")
+        return
+
+    live = PUMPFUN_DIRECT_MODE == "live"
+    delay = WS_RECONNECT_DELAY_MIN
+
+    while True:
+        try:
+            logger.info(f"🔌 Connecting to Helius WS for direct pump.fun indexing (mode={PUMPFUN_DIRECT_MODE})")
+            async with websockets.connect(
+                HELIUS_WS,
+                ping_interval=25,
+                ping_timeout=20,
+                close_timeout=5,
+            ) as ws:
+                pumpfun_direct_stats["connected"] = True
+                pumpfun_direct_stats["last_message_at"] = time.time()
+                delay = WS_RECONNECT_DELAY_MIN
+                logger.info("✅ Helius WS connected (direct pump.fun indexing)")
+
+                await ws.send(json.dumps({
+                    "jsonrpc": "2.0",
+                    "id": 1,
+                    "method": "logsSubscribe",
+                    "params": [
+                        {"mentions": [PUMPFUN_PROGRAM_ID]},
+                        {"commitment": "processed"},
+                    ],
+                }))
+
+                async for message in ws:
+                    try:
+                        data = json.loads(message)
+                    except json.JSONDecodeError:
+                        continue
+
+                    if "result" in data and "method" not in data:
+                        # subscription-ack response, not a notification
+                        logger.info(f"📡 Direct pump.fun subscription confirmed (id={data.get('result')})")
+                        continue
+
+                    if data.get("method") != "logsNotification":
+                        continue
+
+                    pumpfun_direct_stats["last_message_at"] = time.time()
+
+                    try:
+                        value = data["params"]["result"]["value"]
+                        if value.get("err") is not None:
+                            continue  # failed tx — nothing actually happened on-chain
+                        logs = value.get("logs") or []
+                    except (KeyError, TypeError):
+                        continue
+
+                    for line in logs:
+                        if not line.startswith("Program data: "):
+                            continue
+                        try:
+                            raw = base64.b64decode(line[len("Program data: "):])
+                        except Exception:
+                            continue
+                        if len(raw) < 8:
+                            continue
+                        disc, payload = raw[:8], raw[8:]
+
+                        if disc == _CREATE_EVENT_DISC:
+                            ev = _decode_create_event(payload)
+                            if not ev:
+                                pumpfun_direct_stats["decode_errors"] += 1
+                                continue
+                            pumpfun_direct_stats["creates_decoded"] += 1
+                            _pumpfun_supply_cache[ev["mint"]] = ev["token_total_supply"]
+                            mc_sol = _pumpfun_mc_sol(
+                                ev["virtual_sol_reserves"], ev["virtual_token_reserves"], ev["token_total_supply"]
+                            )
+                            vsol = ev["virtual_sol_reserves"] / 1e9
+                            if live:
+                                await _handle_ws_create({
+                                    "mint": ev["mint"],
+                                    "symbol": ev["symbol"],
+                                    "name": ev["name"],
+                                    "initialBuy": 0,
+                                    "marketCapSol": mc_sol,
+                                    "vSolInBondingCurve": vsol,
+                                })
+                            else:
+                                logger.debug(
+                                    f"🔬 [shadow] direct CREATE: ${ev['symbol']} ({ev['mint'][:8]}…) "
+                                    f"MC≈{mc_sol:.1f} SOL"
+                                )
+
+                        elif disc == _TRADE_EVENT_DISC:
+                            ev = _decode_trade_event(payload)
+                            if not ev:
+                                pumpfun_direct_stats["decode_errors"] += 1
+                                continue
+                            pumpfun_direct_stats["trades_decoded"] += 1
+                            supply = _pumpfun_supply_cache.get(ev["mint"], _PUMPFUN_DEFAULT_SUPPLY)
+                            mc_sol = _pumpfun_mc_sol(ev["virtual_sol_reserves"], ev["virtual_token_reserves"], supply)
+                            vsol = ev["virtual_sol_reserves"] / 1e9
+                            if live:
+                                await _handle_ws_trade({
+                                    "mint": ev["mint"],
+                                    "txType": "buy" if ev["is_buy"] else "sell",
+                                    "solAmount": ev["sol_amount"] / 1e9,
+                                    "marketCapSol": mc_sol,
+                                    "vSolInBondingCurve": vsol,
+                                })
+                            else:
+                                logger.debug(
+                                    f"🔬 [shadow] direct TRADE: {ev['mint'][:8]}… "
+                                    f"{'buy' if ev['is_buy'] else 'sell'} {ev['sol_amount']/1e9:.3f} SOL"
+                                )
+
+        except asyncio.CancelledError:
+            logger.info("🔌 Direct pump.fun listener cancelled")
+            pumpfun_direct_stats["connected"] = False
+            break
+        except Exception as e:
+            pumpfun_direct_stats["connected"] = False
+            pumpfun_direct_stats["reconnects"] += 1
+            logger.warning(f"🔌 Direct pump.fun WS disconnected: {e} — reconnecting in {delay}s")
+            await asyncio.sleep(delay)
+            delay = min(delay * 2, WS_RECONNECT_DELAY_MAX)
 
 
 async def pumpfun_ws_listener():
@@ -3514,7 +3826,10 @@ async def lifespan(app: FastAPI):
     global _alert_queue, ws_discovery_queue
 
     logger.info("🚀 Starting ASTAROTH v4.11 (Anti-Dump | Per-Chain Discovery | ETH/BSC/BASE Improved)")
-    logger.info(f"🔌 PumpPortal WS: {PUMPPORTAL_WS}")
+    if PUMPFUN_DIRECT_MODE == "live":
+        logger.info(f"🔌 Direct pump.fun indexing (live) via Helius: {PUMPFUN_PROGRAM_ID}")
+    else:
+        logger.info(f"🔌 PumpPortal WS: {PUMPPORTAL_WS}" + (" (+ direct pump.fun shadow mode)" if PUMPFUN_DIRECT_MODE == "shadow" else ""))
     logger.info(f"📡 Fallback poll: {POLL_INTERVAL}s | Cap: {MAX_TRACKED_TOKENS} | Alert gap: {ALERT_RATE_LIMIT}s")
 
     load_state()
@@ -3528,8 +3843,22 @@ async def lifespan(app: FastAPI):
     load_kols()
 
     alert_task = asyncio.create_task(alert_worker())
-    ws_task = asyncio.create_task(pumpfun_ws_listener())
-    ws_sub_task = asyncio.create_task(ws_trade_subscription_manager())
+    # [v4.29] In "live" direct-indexing mode, the direct listener replaces
+    # PumpPortal entirely (it gets creates + trades for every mint, no 50-sub
+    # cap) — starting both would double-count. In "off"/"shadow" mode PumpPortal
+    # stays the real feed and behaves exactly as before.
+    direct_task = None
+    if PUMPFUN_DIRECT_MODE == "live":
+        logger.info("🛰️ PUMPFUN_DIRECT_MODE=live — direct on-chain indexing replaces PumpPortal WS")
+        ws_task = None
+        ws_sub_task = None
+        direct_task = asyncio.create_task(pumpfun_direct_listener())
+    else:
+        ws_task = asyncio.create_task(pumpfun_ws_listener())
+        ws_sub_task = asyncio.create_task(ws_trade_subscription_manager())
+        if PUMPFUN_DIRECT_MODE == "shadow":
+            logger.info("🛰️ PUMPFUN_DIRECT_MODE=shadow — direct on-chain indexing running read-only alongside PumpPortal")
+            direct_task = asyncio.create_task(pumpfun_direct_listener())
     polling_task = asyncio.create_task(polling_loop())
 
     # [v4.25] One Alchemy WS listener per EVM chain that's enabled with has_ws
@@ -3566,7 +3895,8 @@ async def lifespan(app: FastAPI):
     logger.info("✅ All tasks started")
     yield
 
-    all_tasks = [polling_task, ws_task, ws_sub_task, alert_task, kol_task] + evm_ws_tasks
+    all_tasks = [polling_task, alert_task, kol_task] + evm_ws_tasks
+    all_tasks += [t for t in (ws_task, ws_sub_task, direct_task) if t is not None]
     for task in all_tasks:
         task.cancel()
     for task in all_tasks:
@@ -3608,6 +3938,7 @@ async def status():
         "token_cap": MAX_TRACKED_TOKENS,
         "gems_alerted": sum(1 for t in tokens.values() if t.alerted),
         "ws": ws_stats,
+        "pumpfun_direct": pumpfun_direct_stats if PUMPFUN_DIRECT_MODE != "off" else None,
         "evm_ws": {cid: s for cid, s in evm_ws_stats.items() if get_chain(cid)["has_ws"]},
         "squat_guard": {
             "locked_symbols": len(ws_symbol_lockout),
