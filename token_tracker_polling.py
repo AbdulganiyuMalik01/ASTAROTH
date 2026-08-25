@@ -542,10 +542,28 @@ KOL_POST_LOOKBACK = 300               # only consider posts from last 5 minutes
 KOL_ALERT_COOLDOWN = 600              # 10 min cooldown per KOL+ticker pair
 KOL_MAX_ACCOUNTS = 50                 # hard cap on KOL list size
 RAPIDAPI_KEY = os.getenv("RAPIDAPI_KEY", "")  # Twttr API key from rapidapi.com (twitter241.p.rapidapi.com)
+# [v4.32] The previous three instances were all confirmed dead (checked against
+# a live Nitter instance-health tracker on 2026-08-25: nitter.poast.org shown
+# down, the other two no longer even tracked) — meaning KOL/tweet polling had
+# been silently returning zero posts every cycle with nothing logged to show
+# it. Swapped in the instances that tracker showed with the best uptime.
+#
+# Caveat, found while double-checking these before shipping: direct RSS
+# fetches against all four of them returned 403/410 errors rather than a
+# feed. That may be specific to how the check was made (some Nitter fronts
+# gate scraper-looking requests without blocking regular use) rather than
+# proof they're broken for this bot's own requests — Nitter's whole ecosystem
+# is under sustained pressure from X and instance health/RSS availability is
+# known to fluctuate day to day. Treat this list as a real improvement over
+# three confirmed-dead entries, not a guarantee — if KOL alerts still aren't
+# firing after this, Nitter's RSS access itself is likely blocked platform-
+# wide right now, and RAPIDAPI_KEY (see fetch_kol_posts_rapidapi below) is
+# the more durable fix at that point, not another instance swap.
 NITTER_INSTANCES = [
-    "https://nitter.privacydev.net",
-    "https://nitter.poast.org",
-    "https://nitter.1d4.us",
+    "https://xcancel.com",
+    "https://nitter.net",
+    "https://nitter.kareem.one",
+    "https://nitter.catsarch.com",
 ]
 # Regex: match $TICKER (2-10 uppercase letters/digits) in post text
 TICKER_RE = __import__('re').compile(r'\$([A-Za-z][A-Za-z0-9]{1,9})')
@@ -626,6 +644,21 @@ evm_ws_stats: Dict[str, dict] = {
           "trades_received": 0, "swap_subs": 0}
     for cid in ("bsc", "base", "ethereum")
 }
+
+# [v4.32] KOL/tweet-tracker visibility — both fetch paths (Nitter, RapidAPI)
+# fail by simply returning an empty list, with nothing logged to distinguish
+# "no new tweets right now" from "every fetch has been silently failing for
+# hours." This surfaces that distinction in /status instead of requiring a
+# code read to notice — see kol_polling_loop.
+kol_stats = {
+    "last_fetch_attempt": 0.0,
+    "last_post_found_at": 0.0,
+    "consecutive_empty_polls": 0,
+    "warned_stale": False,
+}
+# How many fully-empty poll rounds (every KOL, zero posts from either path)
+# before logging a one-time warning that the fetch paths might be dead.
+KOL_STALE_WARN_THRESHOLD = 20  # roughly ~1-2 KOL_POLL_INTERVAL cycles per handle
 
 # [v4.26] EVM swap/volume feed state — per chain.
 # pair_address(lower) -> {"mint", "base_token", "base_is_token0", "dex"}
@@ -1346,7 +1379,11 @@ async def fetch_kol_posts_nitter(
             async with session.get(
                 url,
                 timeout=aiohttp.ClientTimeout(total=8),
-                headers={"User-Agent": "Mozilla/5.0 ASTAROTH/1.0"},
+                # [v4.32] Was "Mozilla/5.0 ASTAROTH/1.0" — self-identifying as a
+                # bot in the UA string is an easy target for basic WAF/bot-
+                # detection rules in front of a Nitter instance. A plain
+                # browser-shaped UA at least doesn't hand-wave a free block.
+                headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36"},
             ) as resp:
                 if resp.status != 200:
                     continue
@@ -1650,9 +1687,30 @@ async def kol_polling_loop(session: aiohttp.ClientSession):
                     continue
 
                 # Try Nitter first, fall back to RapidAPI
+                kol_stats["last_fetch_attempt"] = now
                 posts = await fetch_kol_posts_nitter(handle, session)
                 if not posts:
                     posts = await fetch_kol_posts_rapidapi(handle, session)
+
+                # [v4.32] Track whether fetches are actually finding anything —
+                # both fetch functions return [] on total failure (dead Nitter
+                # instances, missing RAPIDAPI_KEY) exactly the same as they do
+                # on "this account genuinely hasn't posted lately," so this is
+                # the only way to tell the two apart from the logs.
+                if posts:
+                    kol_stats["last_post_found_at"] = now
+                    kol_stats["consecutive_empty_polls"] = 0
+                    kol_stats["warned_stale"] = False
+                else:
+                    kol_stats["consecutive_empty_polls"] += 1
+                    if (kol_stats["consecutive_empty_polls"] >= KOL_STALE_WARN_THRESHOLD
+                            and not kol_stats["warned_stale"] and handles):
+                        kol_stats["warned_stale"] = True
+                        logger.warning(
+                            f"📋 KOL tracker: {kol_stats['consecutive_empty_polls']} consecutive "
+                            f"empty polls across {len(handles)} account(s) — Nitter instances may "
+                            f"all be down and RAPIDAPI_KEY may be unset. Check /status -> kol."
+                        )
 
                 await process_kol_posts(handle, posts, session)
                 save_kols()
@@ -4035,6 +4093,7 @@ async def status():
         "gems_alerted": sum(1 for t in tokens.values() if t.alerted),
         "ws": ws_stats,
         "pumpfun_direct": pumpfun_direct_stats if PUMPFUN_DIRECT_MODE != "off" else None,
+        "kol": {**kol_stats, "accounts": len(kol_accounts)},
         "evm_ws": {cid: s for cid, s in evm_ws_stats.items() if get_chain(cid)["has_ws"]},
         "squat_guard": {
             "locked_symbols": len(ws_symbol_lockout),
