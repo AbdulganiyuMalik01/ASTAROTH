@@ -163,8 +163,20 @@ ALCHEMY_WS_URLS = {
 
 # keccak256 topic0 hashes — identical across every V2/V3-style fork since the
 # event signatures never change. Verified against live BscScan/Etherscan logs.
-_PAIR_CREATED_TOPIC = "0x0d3648bd0f6ba80134a33ba9275ac585d9d315f0ad8355cddefde31afa28d0e"  # PairCreated(address,address,address,uint256)
-_POOL_CREATED_TOPIC = "0x783cca1c0412dd0d695e784568c96da2e9c22ff989357a2e8b1d9b2b4e6b661"  # PoolCreated(address,address,uint24,int24,address)
+# [v4.30 CRITICAL FIX] Both constants below were truncated by one trailing hex
+# character (63 hex chars instead of the required 64 = 32 bytes) — an invalid
+# topic0 can never equal a real on-chain log's topic0 (log_topics[0].lower()
+# is always exactly 64 hex chars), so PancakeV2/V3 (BSC) and UniswapV2/V3
+# (Ethereum + Base) WS discovery has been silently dead on arrival: every
+# factory log using these two topics failed the `topic0 == ...` check and was
+# dropped, forcing those chains onto slow DexScreener-polling-only discovery
+# the whole time. Only Aerodrome on Base (a distinct, correctly-length topic)
+# was ever actually reaching WS discovery. Recomputed via keccak256 of the
+# canonical signatures and independently confirmed against multiple real
+# Etherscan/BscScan/PolygonScan/BaseScan transaction logs carrying these exact
+# corrected hashes as their topic0.
+_PAIR_CREATED_TOPIC = "0x0d3648bd0f6ba80134a33ba9275ac585d9d315f0ad8355cddefde31afa28d0e9"  # PairCreated(address,address,address,uint256)
+_POOL_CREATED_TOPIC = "0x783cca1c0412dd0d695e784568c96da2e9c22ff989357a2e8b1d9b2b4e6b7118"  # PoolCreated(address,address,uint24,int24,address)
 # [v4.28] Solidly-fork PoolCreated (Aerodrome on Base, Velodrome-style forks
 # elsewhere) — different signature than Uniswap V3's PoolCreated (adds an
 # indexed `stable` bool, drops fee/tickSpacing) so it needs its own topic0.
@@ -174,10 +186,10 @@ _POOL_CREATED_TOPIC = "0x783cca1c0412dd0d695e784568c96da2e9c22ff989357a2e8b1d9b2
 _SOLIDLY_POOL_CREATED_TOPIC = "0x2128d88d14c80cb081c1252a5acff7a264671bf199ce226b53788fb26065005e"
 
 # Factory contracts to watch per chain. Addresses verified against BscScan /
-# Etherscan / BaseScan on 2026-08-22 — these are long-lived, canonical
-# deployments and shouldn't need updating, but if a chain silently stops
-# producing WS discoveries, check here first (a DEX may have shipped a new
-# factory version since).
+# Etherscan / BaseScan on 2026-08-22 (SushiSwap entries added/verified
+# 2026-08-25) — these are long-lived, canonical deployments and shouldn't
+# need updating, but if a chain silently stops producing WS discoveries,
+# check here first (a DEX may have shipped a new factory version since).
 EVM_FACTORIES = {
     "bsc": [
         {"address": "0xcA143Ce32Fe78f1f7019d7d551a6402fC5350c73", "topic": _PAIR_CREATED_TOPIC, "dex": "PancakeV2"},
@@ -186,6 +198,11 @@ EVM_FACTORIES = {
     "ethereum": [
         {"address": "0x5C69bEe701ef814a2B6a3EDD4B1652CB9cc5aA6f", "topic": _PAIR_CREATED_TOPIC, "dex": "UniswapV2"},
         {"address": "0x1F98431c8aD98523631AE4a59f267346ea31F984", "topic": _POOL_CREATED_TOPIC, "dex": "UniswapV3"},
+        # [v4.30] SushiSwap — a straight Uniswap V2/V3 fork so it reuses the
+        # same topics. Addresses cross-checked against Etherscan's own labels
+        # ("SushiSwap: SushiV2Factory" / "SushiSwap V3: Factory").
+        {"address": "0xC0AEe478e3658e2610c5F7A4A2E1777cE9e4f2Ac", "topic": _PAIR_CREATED_TOPIC, "dex": "SushiV2"},
+        {"address": "0xbACEB8eC6b9355Dfc0269C18bac9d6E2Bdc29C4F", "topic": _POOL_CREATED_TOPIC, "dex": "SushiV3"},
     ],
     "base": [
         {"address": "0x33128a8fC17869897dcE68Ed026d694621f6FDfD", "topic": _POOL_CREATED_TOPIC, "dex": "UniswapV3"},
@@ -194,6 +211,9 @@ EVM_FACTORIES = {
         # discovery lagged Solana's. Verified factory address + topic0
         # against a live BaseScan PoolCreated log (see topic comment above).
         {"address": "0x420DD381b31aEf6683db6B902084cB0FFECe40Da", "topic": _SOLIDLY_POOL_CREATED_TOPIC, "dex": "Aerodrome"},
+        # [v4.30] SushiSwap V3 on Base — same Uniswap V3 fork, same topic0.
+        # Address cross-checked against BaseScan's own label ("SushiSwap V3: Factory").
+        {"address": "0xc35DADB65012eC5796536bD9864eD8773aBc74C4", "topic": _POOL_CREATED_TOPIC, "dex": "SushiV3"},
     ],
 }
 
@@ -297,9 +317,15 @@ def _hex_word_to_signed_int(word_hex: str) -> int:
 # [v4.9] Multi-chain support
 # Each chain: enabled, has_ws (PumpPortal for Solana, Alchemy for the rest —
 # only on if ALCHEMY_API_KEY is set), dexscreener chain id, explorer base url
+#
+# [v4.30] Solana disabled by default — all tracking effort/capacity goes to
+# BSC/Base/Ethereum instead. This is a config flip, not a code removal: every
+# Solana code path (PumpPortal WS, the direct pump.fun indexer, squat-guard
+# dedup) is still here and fully working, just never started while this is
+# off. Set ENABLE_SOLANA=true (env var) to bring it back with no code change.
 CHAINS: Dict[str, dict] = {
     "solana": {
-        "enabled": _env_bool("ENABLE_SOLANA", True),
+        "enabled": _env_bool("ENABLE_SOLANA", False),
         "has_ws": True,
         "chain_id": "solana",
         "explorer": "https://dexscreener.com/solana/{}",
@@ -357,11 +383,23 @@ def _chain_thresholds(prefix: str, age_min, age_max, mc_min, mc_max,
 # hard with the vol/buy-ratio/min-buys gates — too few tokens had time to
 # clear all of them before aging out of range.) mc_min/mc_max stay per-chain
 # env overridable (SOL_MC_MIN/SOL_MC_MAX etc.) in case one chain needs retuning.
+#
+# [v4.30] With Solana disabled, ALERT_RATE_LIMIT (global 30s gap) and
+# GEM_COOLDOWN (global 5min per-token re-alert) are no longer shared with by
+# far the highest-volume/highest-alert-frequency chain — BSC/Base/Ethereum
+# now have the whole alert budget to themselves. Loosened buy_ratio_min
+# (0.52 -> 0.48, same relative move as the v4.8 0.60 -> 0.52 change) and
+# min_buys_h1 for bsc/base (8 -> 6) to take advantage of that freed room —
+# these two chains can now afford a slightly less-proven signal without
+# risking getting crowded out by SOL noise, since there isn't any anymore.
+# Ethereum's min_buys_h1 stays at 3 (already the lowest — ETH's low tx
+# velocity means further lowering risks quality, not just volume) and
+# solana's thresholds are untouched/dormant while ENABLE_SOLANA=false.
 CHAIN_THRESHOLDS = {
     "solana":   _chain_thresholds("SOL",  3 * 60,  6 * 3600, 10_000,        50_000, 0.15, 5_000, 0.52, 10),
-    "bsc":      _chain_thresholds("BSC",  2 * 60, 12 * 3600, 10_000,        50_000, 0.08, 5_000, 0.52, 8),
-    "base":     _chain_thresholds("BASE", 3 * 60,  6 * 3600, 10_000,        50_000, 0.10, 5_000, 0.52, 8),
-    "ethereum": _chain_thresholds("ETH",  2 * 60, 24 * 3600, 10_000,        50_000, 0.05, 5_000, 0.52, 3),
+    "bsc":      _chain_thresholds("BSC",  2 * 60, 12 * 3600, 10_000,        50_000, 0.08, 5_000, 0.48, 6),
+    "base":     _chain_thresholds("BASE", 3 * 60,  6 * 3600, 10_000,        50_000, 0.10, 5_000, 0.48, 6),
+    "ethereum": _chain_thresholds("ETH",  2 * 60, 24 * 3600, 10_000,        50_000, 0.05, 5_000, 0.48, 3),
 }
 
 def get_thresholds(chain_id: str) -> dict:
@@ -430,7 +468,15 @@ _TRADE_EVENT_DISC = bytes([189, 219, 127, 211, 78, 230, 97, 238])
 _PUMPFUN_DEFAULT_SUPPLY = 1_000_000_000 * 10 ** 6
 
 POLL_INTERVAL = 15            # [v4.5] Reduced — WS handles discovery now
-TOKENS_PER_POLL = 30
+# [v4.30] Bumped 30 -> 50 now that BSC/Base/ETH are the only chains getting
+# per-chain dedicated-search budget (see fetch_chain_new_pairs) — no reason to
+# hold back page depth per chain when there are only 3 to cover instead of 4.
+TOKENS_PER_POLL = 50
+# [v4.30] How deep into DexScreener's ALL-CHAINS combined new-pairs feed to
+# scan before filtering down to our enabled chains. See fetch_new_tokens() for
+# why this must scale up, not down, as fewer chains are enabled — the profile
+# feed's global volume doesn't shrink just because we stopped tracking Solana.
+NEW_PAIRS_SCAN_DEPTH = int(os.getenv("NEW_PAIRS_SCAN_DEPTH", "400"))
 
 # Gem detection thresholds
 GEM_AGE_MIN = 3 * 60           # 3 min — catch tokens as early as possible
@@ -452,6 +498,10 @@ GEM_VOL_ACCEL_MC_MAX = 50_000  # [v4.28] vol-accel ceiling aligned to the 10k-50
 MULTIPLIER_MILESTONES = [2.0, 3.0, 5.0, 10.0]
 
 # Token pool management
+# [v4.30] This cap is shared across all enabled chains, not per-chain — with
+# Solana disabled (by far the highest-churn chain, it was likely consuming
+# most of this pool on its own) BSC/Base/ETH now get effectively the whole
+# 750-slot budget to themselves with no code change needed here.
 MAX_TRACKED_TOKENS = 750
 TOKEN_MAX_AGE_SECONDS = 6 * 3600
 TOKEN_STALE_AGE_SECONDS = 90 * 60
@@ -2322,6 +2372,11 @@ async def evm_ws_listener(chain_id: str):
     topics = list({f["topic"] for f in factories})  # OR'd within this topic slot
     base_tokens = EVM_BASE_TOKENS.get(chain_id, set())
     base_token_decimals = EVM_BASE_TOKEN_DECIMALS.get(chain_id, {})
+    # [v4.30] Purely a log label — when two factories on the same chain share a
+    # topic (e.g. UniswapV3 and SushiV3 both emit the standard PoolCreated),
+    # the later entry's name wins here for whichever one is logged. Detection
+    # itself is unaffected: eth_subscribe filters by the full address list, so
+    # every factory below is watched regardless of any topic collision.
     dex_by_topic = {f["topic"]: f["dex"] for f in factories}
 
     delay = WS_EVM_RECONNECT_DELAY_MIN
@@ -2553,6 +2608,16 @@ async def fetch_new_tokens(session: aiohttp.ClientSession) -> List[Dict]:
     [v4.9] Polls DexScreener for new tokens across ALL enabled chains.
     Solana is also covered here as a fallback (WS is primary for Solana).
     BSC and Base are polling-only.
+
+    [v4.30] The combined DEXSCREENER_NEW_PAIRS feed spans every chain
+    DexScreener tracks (dozens), and Solana is by far the highest-volume new-
+    pair chain on it — that stayed true even with Solana disabled here, since
+    real-world Solana launch activity doesn't stop just because this bot
+    isn't tracking it. The old `TOKENS_PER_POLL * len(ENABLED_CHAIN_IDS)` slice
+    shrank as chains got disabled, which is backwards: fewer enabled chains
+    means a SMALLER share of the combined feed's top-N is relevant, so the
+    slice needs to scan deeper, not shallower, to surface enough BSC/Base/ETH
+    entries once Solana's share of that same window is discarded.
     """
     new_tokens = []
     try:
@@ -2563,7 +2628,7 @@ async def fetch_new_tokens(session: aiohttp.ClientSession) -> List[Dict]:
             if resp.status == 200:
                 data = await resp.json()
                 profiles = data if isinstance(data, list) else data.get("data", [])
-                for profile in profiles[:TOKENS_PER_POLL * len(ENABLED_CHAIN_IDS)]:
+                for profile in profiles[:NEW_PAIRS_SCAN_DEPTH]:
                     chain = profile.get("chainId")
                     if chain not in ENABLED_CHAIN_IDS:
                         continue
@@ -3826,7 +3891,10 @@ async def lifespan(app: FastAPI):
     global _alert_queue, ws_discovery_queue
 
     logger.info("🚀 Starting ASTAROTH v4.11 (Anti-Dump | Per-Chain Discovery | ETH/BSC/BASE Improved)")
-    if PUMPFUN_DIRECT_MODE == "live":
+    sol_enabled = get_chain("solana")["enabled"]
+    if not sol_enabled:
+        logger.info("⏸️ Solana disabled (ENABLE_SOLANA=false) — PumpPortal/direct pump.fun listeners not starting; all capacity goes to BSC/Base/ETH")
+    elif PUMPFUN_DIRECT_MODE == "live":
         logger.info(f"🔌 Direct pump.fun indexing (live) via Helius: {PUMPFUN_PROGRAM_ID}")
     else:
         logger.info(f"🔌 PumpPortal WS: {PUMPPORTAL_WS}" + (" (+ direct pump.fun shadow mode)" if PUMPFUN_DIRECT_MODE == "shadow" else ""))
@@ -3847,18 +3915,23 @@ async def lifespan(app: FastAPI):
     # PumpPortal entirely (it gets creates + trades for every mint, no 50-sub
     # cap) — starting both would double-count. In "off"/"shadow" mode PumpPortal
     # stays the real feed and behaves exactly as before.
+    # [v4.30] None of this starts at all when Solana is disabled — no PumpPortal
+    # connection, no direct pump.fun WS, no squat-guard bookkeeping. That's the
+    # whole point of the config-disable: zero SOL-related work competing for
+    # event-loop time/network connections with BSC/Base/ETH.
+    ws_task = None
+    ws_sub_task = None
     direct_task = None
-    if PUMPFUN_DIRECT_MODE == "live":
-        logger.info("🛰️ PUMPFUN_DIRECT_MODE=live — direct on-chain indexing replaces PumpPortal WS")
-        ws_task = None
-        ws_sub_task = None
-        direct_task = asyncio.create_task(pumpfun_direct_listener())
-    else:
-        ws_task = asyncio.create_task(pumpfun_ws_listener())
-        ws_sub_task = asyncio.create_task(ws_trade_subscription_manager())
-        if PUMPFUN_DIRECT_MODE == "shadow":
-            logger.info("🛰️ PUMPFUN_DIRECT_MODE=shadow — direct on-chain indexing running read-only alongside PumpPortal")
+    if sol_enabled:
+        if PUMPFUN_DIRECT_MODE == "live":
+            logger.info("🛰️ PUMPFUN_DIRECT_MODE=live — direct on-chain indexing replaces PumpPortal WS")
             direct_task = asyncio.create_task(pumpfun_direct_listener())
+        else:
+            ws_task = asyncio.create_task(pumpfun_ws_listener())
+            ws_sub_task = asyncio.create_task(ws_trade_subscription_manager())
+            if PUMPFUN_DIRECT_MODE == "shadow":
+                logger.info("🛰️ PUMPFUN_DIRECT_MODE=shadow — direct on-chain indexing running read-only alongside PumpPortal")
+                direct_task = asyncio.create_task(pumpfun_direct_listener())
     polling_task = asyncio.create_task(polling_loop())
 
     # [v4.25] One Alchemy WS listener per EVM chain that's enabled with has_ws
