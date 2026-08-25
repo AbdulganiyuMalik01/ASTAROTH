@@ -45,6 +45,7 @@ import base64
 import html
 import time
 import logging
+import re
 from collections import defaultdict, deque
 from dataclasses import dataclass, field
 from typing import Dict, Optional, Set, List
@@ -566,7 +567,27 @@ NITTER_INSTANCES = [
     "https://nitter.catsarch.com",
 ]
 # Regex: match $TICKER (2-10 uppercase letters/digits) in post text
-TICKER_RE = __import__('re').compile(r'\$([A-Za-z][A-Za-z0-9]{1,9})')
+# [v4.33] fix: this line previously had a stray literal backspace byte just
+# before the closing quote (invisible in a normal editor/diff), which made
+# the compiled pattern require a literal backspace character immediately
+# after every ticker match. Since real tweet text never contains one,
+# TICKER_RE.findall() has been silently returning zero matches this whole
+# time -- the $CASHTAG side of KOL matching was never actually firing.
+TICKER_RE = re.compile(r'\$([A-Za-z][A-Za-z0-9]{1,9})')
+
+# [v4.33] Word/phrase-overlap KOL matching -- catches the common memecoin
+# pattern where a viral word/phrase gets "tokenized" into a new token
+# name/symbol WITHOUT an explicit $CASHTAG mention (e.g. a KOL tweets "based
+# frog just took over my feed" and a token later launches named/symboled
+# BASEDFROG). Purely deterministic word/phrase overlap -- no LLM/semantic
+# summarization -- per explicit choice. Extends, doesn't replace, the
+# extract_tickers()/$CASHTAG path above.
+KOL_KEYWORD_ALERT_COOLDOWN = 600        # per KOL+match, same window as the ticker cooldown
+KOL_KEYWORD_SEARCH_COOLDOWN = 1800      # 30 min, GLOBAL per-keyword -- gates the DexScreener
+                                         # API call itself, so a phrase mentioned by many KOLs
+                                         # inside the same half hour only gets searched once
+KOL_MAX_KEYWORDS_PER_POST = 8           # cap extracted word/phrase candidates per tweet
+KOL_MAX_KEYWORD_SEARCHES_PER_POST = 3   # cap live DexScreener searches fired per tweet
 
 # ============================================================================
 # Global State
@@ -627,6 +648,13 @@ pumpfun_direct_stats = {
 # [v4.7] KOL state
 kol_accounts: Dict[str, dict] = {}    # handle -> {added_at, last_polled, post_ids_seen}
 kol_alert_cooldown: Dict[str, float] = {}  # "handle:TICKER" -> last alert timestamp
+# [v4.33] word/phrase-overlap match cooldowns reuse the dict above with
+# distinct key prefixes ("handle:mint:<mint>" for a matched tracked token,
+# never colliding with the plain "handle:TICKER" keys used for cashtags).
+# This one is separate and GLOBAL (not per-handle) -- it gates the actual
+# DexScreener search call for a given keyword/phrase, independent of which
+# KOL said it or whether an alert ends up firing.
+kol_keyword_search_at: Dict[str, float] = {}  # keyword(concat form) -> last DexScreener search time
 
 # [v4.5] WebSocket stats
 ws_stats = {
@@ -655,6 +683,10 @@ kol_stats = {
     "last_post_found_at": 0.0,
     "consecutive_empty_polls": 0,
     "warned_stale": False,
+    # [v4.33] word/phrase-overlap matching counters
+    "keyword_matches_tracked": 0,   # matched an already-tracked token by word/phrase overlap
+    "keyword_live_searches": 0,     # live DexScreener searches fired for untracked phrases
+    "keyword_live_hits": 0,         # of those searches, how many found a real token match
 }
 # How many fully-empty poll rounds (every KOL, zero posts from either path)
 # before logging a one-time warning that the fetch paths might be dead.
@@ -1363,6 +1395,136 @@ def extract_tickers(text: str) -> List[str]:
     return [t.upper() for t in found if t.upper() not in SKIP]
 
 
+# [v4.33] Common filler/noise words excluded from word/phrase-overlap
+# extraction -- English stopwords plus Twitter/crypto-slang filler that would
+# otherwise dominate every tweet's keyword set and make overlap meaningless.
+KOL_KEYWORD_STOPWORDS = {
+    "the", "and", "for", "with", "this", "that", "just", "like", "your", "you",
+    "are", "was", "were", "have", "has", "had", "will", "would", "could",
+    "should", "about", "into", "over", "out", "not", "but", "all", "can",
+    "get", "got", "now", "new", "big", "one", "two", "see", "look", "looks",
+    "looking", "check", "checking", "going", "gonna", "here", "there", "what",
+    "when", "where", "why", "how", "who", "its", "im", "on", "in", "to", "of",
+    "is", "it", "at", "as", "be", "by", "an", "or", "if", "so", "up", "we",
+    "us", "our", "they", "them", "their", "he", "she", "his", "her", "from",
+    "than", "then", "some", "any", "more", "most", "very", "really", "still",
+    "even", "also", "back", "off", "down", "again", "any", "few", "many",
+    # crypto/twitter filler
+    "gm", "gn", "wagmi", "ngmi", "lfg", "wen", "ser", "fren", "frens", "moon",
+    "mooning", "mooned", "pump", "pumping", "pumped", "dump", "dumping",
+    "dumped", "buy", "buying", "sell", "selling", "bullish", "bearish",
+    "chart", "charts", "coin", "coins", "token", "tokens", "crypto", "huge",
+    "massive", "insane", "crazy", "wow", "lol", "lmao", "amp", "rt", "via",
+    "today", "tonight", "yall", "dont", "cant", "thats", "whats",
+}
+
+# Candidate words: letters/digits/apostrophe, length >= 3.
+_KOL_WORD_RE = re.compile(r"[A-Za-z][A-Za-z0-9']{2,}")
+
+
+def extract_keywords(text: str) -> List[dict]:
+    """
+    Extract candidate word/phrase-overlap targets from a tweet -- the broader
+    signal that catches the common memecoin pattern where a viral word or
+    phrase gets "tokenized" into a new token name/symbol even with no
+    $CASHTAG mention (e.g. "based frog" trending -> a token later launches
+    named/symboled BASEDFROG).
+
+    Each candidate is {"words": [...], "phrase": "based frog", "concat":
+    "basedfrog"} -- single significant words AND adjacent-word bigrams. The
+    bigram's concatenated form is what a token symbol usually looks like once
+    a two-word phrase gets tokenized, so it's checked directly against
+    token symbols; the word list is checked against token *names*.
+
+    Deliberately separate from extract_tickers() ($CASHTAG-only, exact) --
+    this is a noisier signal, so results are capped and downstream matching
+    requires real overlap, not just any shared word.
+    """
+    clean = re.sub(r"https?://\S+", " ", text)
+    clean = re.sub(r"@\w+", " ", clean)
+    clean = re.sub(r"\$[A-Za-z][A-Za-z0-9]{1,9}\b", " ", clean)  # cashtags: extract_tickers' job
+    clean = re.sub(r"^\s*RT\b", " ", clean)
+
+    raw_words = [w.lower() for w in _KOL_WORD_RE.findall(clean)]
+    words = [w for w in raw_words if w not in KOL_KEYWORD_STOPWORDS and len(w) >= 3]
+    if not words:
+        return []
+
+    candidates: List[dict] = []
+    seen_concat = set()
+
+    # Bigrams first (more specific -> lower false-positive rate), built from
+    # adjacency in the FILTERED sequence so "based frog" stays a phrase even
+    # once unrelated filler words around it have been stripped out.
+    for i in range(len(words) - 1):
+        w1, w2 = words[i], words[i + 1]
+        concat = w1 + w2
+        if concat in seen_concat:
+            continue
+        seen_concat.add(concat)
+        candidates.append({"words": [w1, w2], "phrase": f"{w1} {w2}", "concat": concat})
+
+    # Single words -- only long enough ones stand alone as a candidate; short
+    # single words are too noisy to search DexScreener for on their own.
+    for w in words:
+        if len(w) < 5 or w in seen_concat:
+            continue
+        seen_concat.add(w)
+        candidates.append({"words": [w], "phrase": w, "concat": w})
+
+    return candidates[:KOL_MAX_KEYWORDS_PER_POST]
+
+
+def _name_to_words(name: str) -> Set[str]:
+    """Normalize a token name string into significant lowercase words."""
+    raw = re.findall(r"[A-Za-z0-9']{2,}", name or "")
+    return {w.lower() for w in raw if w.lower() not in KOL_KEYWORD_STOPWORDS and len(w) >= 3}
+
+
+def _keyword_match_score(kw: dict, symbol: str, name_words: Set[str]) -> int:
+    """
+    0 = no match. Higher = stronger match, so a caller checking several
+    candidate keywords against the same token can prefer the best one for
+    the alert message (e.g. an exact "based frog" phrase over some other,
+    weaker same-token overlap like "talking based" that happens to share
+    just one word). Matches in two ways:
+      1. The candidate's concatenated form equals the token's symbol exactly
+         -- catches "based frog" -> $BASEDFROG, or a single word like "pepe"
+         mentioned in plain prose matching a token symboled PEPE. Always
+         outranks an overlap-only match.
+      2. The candidate's words overlap meaningfully with the token's name --
+         for a multi-word name, at least half its significant words (and at
+         least one) must appear in the candidate; for a single-word name, it
+         must match that word exactly. This avoids one generic word shared
+         between an unrelated tweet and an unrelated token name counting as
+         a "match". Score is the overlap size, so a fuller-phrase overlap
+         ranks above a partial one.
+    """
+    if not symbol and not name_words:
+        return 0
+    if kw["concat"] == (symbol or "").lower():
+        return 1000
+    if not name_words:
+        return 0
+    kw_words = set(kw["words"])
+    overlap = kw_words & name_words
+    if not overlap:
+        return 0
+    if len(name_words) == 1:
+        return 500 if kw_words == name_words else 0
+    needed = max(1, len(name_words) // 2)
+    if len(overlap) < needed:
+        return 0
+    return len(overlap)
+
+
+def _keyword_matches_token(kw: dict, symbol: str, name_words: Set[str]) -> bool:
+    """Boolean convenience wrapper around _keyword_match_score() -- used on
+    the live-DexScreener-search path, where each search result is judged on
+    its own rather than ranked against sibling candidates."""
+    return _keyword_match_score(kw, symbol, name_words) > 0
+
+
 async def fetch_kol_posts_nitter(
     handle: str, session: aiohttp.ClientSession
 ) -> List[dict]:
@@ -1574,9 +1736,15 @@ async def process_kol_posts(
 ):
     """
     For each new post:
-    1. Extract $TICKER mentions
-    2. If ticker matches a tracked token → fire KOL alert
-    3. If ticker not tracked → add to WS discovery queue for enrichment
+    1. Extract $TICKER mentions (exact) AND word/phrase-overlap keywords
+       (broader -- catches "tokenized" phrases with no cashtag at all).
+    2. If a match (cashtag or word/phrase) hits a tracked token → fire a
+       KOL alert.
+    3. If a $TICKER doesn't match a tracked token → queue a DexScreener
+       symbol lookup (as before). If a word/phrase doesn't match a tracked
+       token → fire a *live* DexScreener search using the phrase itself,
+       rate-limited per keyword (see kol_keyword_search_at), and queue any
+       real hit for enrichment.
     """
     if not posts:
         return
@@ -1585,7 +1753,6 @@ async def process_kol_posts(
     seen_ids: set = set(kol_data.get("post_ids_seen", []))
     now = time.time()
     new_ids = set()
-    alerted_tickers = set()
 
     for post in posts:
         post_id = post["id"]
@@ -1593,61 +1760,65 @@ async def process_kol_posts(
             continue
         new_ids.add(post_id)
 
-        tickers = extract_tickers(post["text"])
-        if not tickers:
+        text = post["text"]
+        tickers = extract_tickers(text)
+        keywords = extract_keywords(text)
+        if not tickers and not keywords:
             continue
 
-        logger.info(f"📋 KOL @{handle} mentioned: {tickers} | '{post['text'][:80]}'")
+        alerted_tickers = set()
+        alerted_mints = set()      # mints already alerted on for THIS post (any match type)
+        matched_concats = set()    # keyword concats already resolved to a tracked token
 
+        if tickers:
+            logger.info(f"📋 KOL @{handle} mentioned: {tickers} | '{text[:80]}'")
+
+        # --- 1. Exact $CASHTAG matching (unchanged logic, now that TICKER_RE
+        #     itself is fixed -- see the [v4.33] fix note on TICKER_RE) ---
         for ticker in tickers:
             if ticker in alerted_tickers:
                 continue
 
             cooldown_key = f"{handle}:{ticker}"
-            if cooldown_key in kol_alert_cooldown:
-                if now - kol_alert_cooldown[cooldown_key] < KOL_ALERT_COOLDOWN:
-                    continue
+            if now - kol_alert_cooldown.get(cooldown_key, 0) < KOL_ALERT_COOLDOWN:
+                continue
 
-            # Find matching tracked token(s)
             matched_tokens = [
                 (mint, t) for mint, t in tokens.items()
                 if t.symbol.upper() == ticker
             ]
 
             if matched_tokens:
-                # Alert for each matched token
                 for mint, token in matched_tokens:
                     kol_alert_cooldown[cooldown_key] = now
                     alerted_tickers.add(ticker)
-                    dex_url = f"https://dexscreener.com/solana/{mint}"
+                    alerted_mints.add(mint)
+                    d_url = dex_url(mint, token.chain_id)
                     gem_tag = "💎 Already gem alerted" if token.alerted else "⏳ Not yet gem"
                     msg = (
                         f"👁️ <b>KOL MENTION: @{handle}</b>\n\n"
-                        f"💬 <i>{post['text'][:200].strip()}</i>\n\n"
+                        f"💬 <i>{text[:200].strip()}</i>\n\n"
                         f"🎯 Tracked: <b>${token.symbol}</b>\n"
                         f"💰 MC: ${token.market_cap:,.0f}\n"
                         f"📊 Vol: ${token.volume_usd:,.0f}\n"
                         f"{gem_tag}\n\n"
-                        f"🔗 <a href='{dex_url}'>DexScreener</a>"
+                        f"🔗 <a href='{d_url}'>DexScreener</a>"
                     )
                     await send_telegram(msg)
                     logger.info(f"👁️ KOL alert: @{handle} → ${ticker} (tracked)")
             else:
-                # Ticker not tracked — add to discovery queue (Option B)
                 kol_alert_cooldown[cooldown_key] = now
                 alerted_tickers.add(ticker)
                 logger.info(f"👁️ KOL @{handle} → ${ticker} (unknown — queuing for discovery)")
 
-                # Send a heads-up alert
                 msg = (
                     f"👁️ <b>KOL MENTION: @{handle}</b>\n\n"
-                    f"💬 <i>{post['text'][:200].strip()}</i>\n\n"
+                    f"💬 <i>{text[:200].strip()}</i>\n\n"
                     f"🔍 <b>${ticker}</b> — not yet tracked\n"
                     "⚡ Queuing for DexScreener lookup..."
                 )
                 await send_telegram(msg)
 
-                # Queue a DexScreener search for this ticker
                 if ws_discovery_queue is not None:
                     await ws_discovery_queue.put({
                         "mint": None,  # unknown — enrich worker will search by symbol
@@ -1660,6 +1831,119 @@ async def process_kol_posts(
                         "kol_source": handle,
                         "search_by_symbol": True,  # flag for enrich worker
                     })
+
+        # --- 2. Word/phrase overlap against currently TRACKED tokens ---
+        # No cashtag required -- this is what catches "based frog" style
+        # mentions of an already-launched token nobody put a $ in front of.
+        if keywords:
+            # Loop TOKENS outer, keywords inner, so each token is judged
+            # against every candidate and alerted using the BEST-scoring one
+            # (e.g. an exact "based frog" phrase, not an incidental single-
+            # word overlap like "talking based" that happens to appear first).
+            for mint, token in list(tokens.items()):
+                if mint in alerted_mints:
+                    continue
+                name_words = _name_to_words(token.name)
+                best_kw, best_score = None, 0
+                for kw in keywords:
+                    if kw["concat"] in matched_concats:
+                        continue
+                    score = _keyword_match_score(kw, token.symbol, name_words)
+                    if score > best_score:
+                        best_score, best_kw = score, kw
+                if best_kw is None:
+                    continue
+
+                cooldown_key = f"{handle}:mint:{mint}"
+                if now - kol_alert_cooldown.get(cooldown_key, 0) < KOL_KEYWORD_ALERT_COOLDOWN:
+                    continue
+                kol_alert_cooldown[cooldown_key] = now
+                alerted_mints.add(mint)
+                matched_concats.add(best_kw["concat"])
+                kol_stats["keyword_matches_tracked"] += 1
+                d_url = dex_url(mint, token.chain_id)
+                gem_tag = "💎 Already gem alerted" if token.alerted else "⏳ Not yet gem"
+                msg = (
+                    f"👁️ <b>KOL WORD MATCH: @{handle}</b>\n\n"
+                    f"💬 <i>{text[:200].strip()}</i>\n\n"
+                    f"🎯 Tracked: <b>${token.symbol}</b> (matched \"{best_kw['phrase']}\")\n"
+                    f"💰 MC: ${token.market_cap:,.0f}\n"
+                    f"📊 Vol: ${token.volume_usd:,.0f}\n"
+                    f"{gem_tag}\n\n"
+                    f"🔗 <a href='{d_url}'>DexScreener</a>"
+                )
+                await send_telegram(msg)
+                logger.info(f"👁️ KOL word-match alert: @{handle} → ${token.symbol} via '{best_kw['phrase']}'")
+
+        # --- 3. Word/phrase overlap against a LIVE DexScreener search ---
+        # For any keyword that didn't already resolve to a tracked token,
+        # actively search DexScreener for a token whose name/symbol matches
+        # the phrase -- this is what catches a phrase getting tokenized into
+        # something the bot's own discovery hasn't picked up (yet).
+        searches_done = 0
+        for kw in keywords:
+            if searches_done >= KOL_MAX_KEYWORD_SEARCHES_PER_POST:
+                break
+            if kw["concat"] in matched_concats:
+                continue  # already resolved against a tracked token above
+
+            concat = kw["concat"]
+            if now - kol_keyword_search_at.get(concat, 0) < KOL_KEYWORD_SEARCH_COOLDOWN:
+                continue
+            kol_keyword_search_at[concat] = now
+            searches_done += 1
+            kol_stats["keyword_live_searches"] += 1
+
+            try:
+                async with session.get(
+                    f"{DEXSCREENER_SEARCH}?q={kw['phrase']}",
+                    timeout=aiohttp.ClientTimeout(total=8),
+                ) as resp:
+                    if resp.status != 200:
+                        continue
+                    data = await resp.json()
+                    for pair in data.get("pairs", [])[:5]:
+                        if pair.get("chainId") not in ENABLED_CHAIN_IDS:
+                            continue
+                        base = pair.get("baseToken", {})
+                        found_mint = base.get("address")
+                        if not found_mint or found_mint in tokens or found_mint in alerted_mints:
+                            continue
+                        p_symbol = base.get("symbol", "")
+                        p_name = base.get("name", "")
+                        if not _keyword_matches_token(kw, p_symbol, _name_to_words(p_name)):
+                            continue
+
+                        alerted_mints.add(found_mint)
+                        kol_stats["keyword_live_hits"] += 1
+                        pair_chain = pair.get("chainId", "solana")
+                        if ws_discovery_queue is not None:
+                            await ws_discovery_queue.put({
+                                "mint": found_mint,
+                                "symbol": p_symbol.upper(),
+                                "name": p_name or p_symbol,
+                                "chain_id": pair_chain,
+                                "created_at": now,
+                                "ws_discovered": False,
+                                "ws_initial_buy_sol": 0.0,
+                                "mc_sol_at_creation": 0.0,
+                                "kol_source": handle,
+                            })
+                        msg = (
+                            f"👁️ <b>KOL WORD MATCH: @{handle}</b>\n\n"
+                            f"💬 <i>{text[:200].strip()}</i>\n\n"
+                            f"🔍 Phrase <b>\"{html.escape(kw['phrase'])}\"</b> ↔ <b>${html.escape(p_symbol.upper())}</b>"
+                            f" (\"{html.escape(p_name)}\") — not yet tracked\n"
+                            "⚡ Queuing for DexScreener enrichment..."
+                        )
+                        await send_telegram(msg)
+                        logger.info(
+                            f"👁️ KOL @{handle} phrase '{kw['phrase']}' → "
+                            f"${p_symbol.upper()} ({found_mint[:8]}...) queued"
+                        )
+                        break  # one hit per keyword search is enough
+            except Exception as e:
+                logger.debug(f"KOL keyword search error '{kw['phrase']}': {e}")
 
     # Update seen post IDs (keep last 200 to avoid unbounded growth)
     all_ids = list(seen_ids | new_ids)[-200:]
