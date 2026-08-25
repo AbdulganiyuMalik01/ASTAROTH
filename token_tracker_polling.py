@@ -571,6 +571,12 @@ class TokenInfo:
     ws_sol_volume: float = 0.0        # live SOL volume from WS trade feed
     ws_buy_vol_usd: float = 0.0       # live buy-side USD volume from WS trade feed
     ws_sell_vol_usd: float = 0.0      # live sell-side USD volume from WS trade feed
+    # [v4.27] Live bonding-curve estimates (Solana pre-graduation tokens). DexScreener
+    # has no pair at all until a pump.fun token migrates off the bonding curve, so
+    # market_cap/liquidity/volume/buy_ratio would otherwise stay frozen at their
+    # creation-time stub forever — see run_detections for how these are used as a
+    # fallback in place of the (permanently absent) DexScreener fields.
+    ws_liquidity_estimate: float = 0.0  # vSolInBondingCurve * SOL price — proxy for liq_min
     # [v4.9] multi-chain
     chain_id: str = "solana"          # which chain this token is on
     # [v4.11] ETH buy volume tracking
@@ -584,6 +590,11 @@ class TokenInfo:
     first_seen_mc: float = 0.0        # MC when first tracked (for dump detection)
     # Reply threading — stores the Telegram message_id of the initial alert
     alert_message_id: int = 0         # used to reply-thread P&L / milestone updates
+    # [v4.27] Cap-eviction ranking score — see update_composite_score(). Was
+    # previously read via getattr(t, "composite_score", 0.0) with no such
+    # field ever actually set, so every eviction candidate silently tied at
+    # 0.0 and enforce_token_cap degraded to pure oldest-first eviction.
+    composite_score: float = 0.0
 
 tokens: Dict[str, TokenInfo] = {}
 tokens_lock = asyncio.Lock()
@@ -625,6 +636,7 @@ def _token_to_dict(token: TokenInfo) -> dict:
         "ws_sol_volume": token.ws_sol_volume,
         "ws_buy_vol_usd": token.ws_buy_vol_usd,
         "ws_sell_vol_usd": token.ws_sell_vol_usd,
+        "ws_liquidity_estimate": token.ws_liquidity_estimate,
         "_sent_milestones": list(getattr(token, '_sent_milestones', set())),
         "chain_id": token.chain_id,
         "buy_volume_h1": token.buy_volume_h1,
@@ -632,6 +644,7 @@ def _token_to_dict(token: TokenInfo) -> dict:
         "price_change_h1": token.price_change_h1,
         "consecutive_green_polls": token.consecutive_green_polls,
         "first_seen_mc": token.first_seen_mc,
+        "composite_score": token.composite_score,
     }
 
 
@@ -665,12 +678,14 @@ def _token_from_dict(d: dict) -> TokenInfo:
         ws_sol_volume=d.get("ws_sol_volume", 0.0),
         ws_buy_vol_usd=d.get("ws_buy_vol_usd", 0.0),
         ws_sell_vol_usd=d.get("ws_sell_vol_usd", 0.0),
+        ws_liquidity_estimate=d.get("ws_liquidity_estimate", 0.0),
         chain_id=d.get("chain_id", "solana"),
         buy_volume_h1=d.get("buy_volume_h1", 0.0),
         volume_m5=d.get("volume_m5", 0.0),
         price_change_h1=d.get("price_change_h1", 0.0),
         consecutive_green_polls=d.get("consecutive_green_polls", 0),
         first_seen_mc=d.get("first_seen_mc", 0.0),
+        composite_score=d.get("composite_score", 0.0),
     )
     t._sent_milestones = set(d.get("_sent_milestones", []))
     return t
@@ -741,6 +756,44 @@ def update_mc_velocity(token: TokenInfo, new_mc: float):
 
 def is_high_velocity(token: TokenInfo) -> bool:
     return token.mc_velocity > 20.0
+
+
+def update_composite_score(token: TokenInfo) -> None:
+    """
+    [v4.27] Lightweight, always-computable momentum score used ONLY for
+    cap-eviction ranking in enforce_token_cap — not alert gating. Built from
+    signals available even for bonding-curve tokens with no DexScreener data
+    yet (mc_velocity, live WS buy pressure, trade count), so a real early
+    runner isn't evicted from the tracked pool just for being "unscored" —
+    which is what happened before this field existed (see its docstring).
+    Call after any update to a token's mc_velocity/ws_buy_count/ws_sell_count.
+    """
+    ws_total = token.ws_buy_count + token.ws_sell_count
+    buy_pressure = (token.ws_buy_count / ws_total) if ws_total > 0 else 0.5
+    token.composite_score = (
+        max(token.mc_velocity, 0.0) * 1.0   # rewards fast MC growth
+        + buy_pressure * 20.0                # rewards buy-dominant live flow
+        + min(ws_total, 50) * 0.5            # rewards real trade activity, capped
+    )
+
+
+def effective_liq_vol_buyratio(token: TokenInfo) -> tuple:
+    """
+    [v4.27] Returns (liq, vol, buy_ratio), preferring real DexScreener data
+    when available and falling back to live WS-derived bonding-curve
+    estimates for pre-graduation Solana tokens (token.liquidity == 0, i.e.
+    DexScreener has no pair yet). Used by both run_detections (to decide
+    whether to alert) and format_gem_alert (so the Telegram card doesn't show
+    a misleading $0 Vol/Liq on an alert that fired specifically because of
+    real bonding-curve activity).
+    """
+    if token.chain_id == "solana" and token.liquidity == 0:
+        ws_total = token.ws_buy_count + token.ws_sell_count
+        liq = token.ws_liquidity_estimate
+        vol = token.ws_buy_vol_usd + token.ws_sell_vol_usd
+        buy_ratio = token.ws_buy_count / max(ws_total, 1) if ws_total >= 5 else token.buy_ratio
+        return liq, vol, buy_ratio
+    return token.liquidity, token.volume_usd, token.buy_ratio
 
 
 def update_vol_history(token: TokenInfo, new_vol: float):
@@ -828,6 +881,12 @@ def enforce_token_cap(symbol: str) -> bool:
     Score-aware eviction: never evict tokens with consecutive_green_polls >= 2
     (i.e. tokens showing sustained momentum). Among evictable candidates, prefer
     to drop the lowest-scored oldest token rather than simply the oldest.
+
+    [v4.27] composite_score is now a real, continuously-updated field (see
+    update_composite_score) — it used to be read via getattr(t,
+    "composite_score", 0.0) with no such attribute ever set anywhere, so every
+    candidate silently tied at 0.0 and this degraded to pure oldest-first
+    eviction regardless of which tokens actually showed momentum.
     """
     if len(tokens) < MAX_TRACKED_TOKENS:
         return True
@@ -1510,6 +1569,7 @@ async def _handle_ws_create(data: dict):
     name = data.get("name", symbol)
     initial_buy = float(data.get("initialBuy", 0) or 0)
     mc_sol = float(data.get("marketCapSol", 0) or 0)
+    vsol_curve = float(data.get("vSolInBondingCurve", 0) or 0)
 
     # Primary dedup: mint address is the canonical unique key
     if mint in seen_mints:
@@ -1562,6 +1622,11 @@ async def _handle_ws_create(data: dict):
     # before DexScreener enrichment completes. Stub MC is estimated from WS data.
     created_ts = time.time()
     estimated_mc = mc_sol * WS_SOL_PRICE_USD
+    # [v4.27] vSolInBondingCurve is the SOL actually locked in the curve — the
+    # closest thing a pre-graduation token has to "liquidity". DexScreener has
+    # no pair for it at all until migration, so without this run_detections'
+    # liq_ok gate would stay permanently unsatisfiable. See run_detections.
+    estimated_liq = vsol_curve * WS_SOL_PRICE_USD
     async with tokens_lock:
         if mint not in tokens:
             if enforce_token_cap(symbol):
@@ -1575,6 +1640,7 @@ async def _handle_ws_create(data: dict):
                     ws_initial_buy_sol=initial_buy,
                     ws_pre_enrichment=True,
                     chain_id="solana",
+                    ws_liquidity_estimate=estimated_liq,
                 )
                 logger.debug(f"🔬 Pre-tracked ${symbol} (stub MC≈${estimated_mc:,.0f})")
 
@@ -1594,7 +1660,8 @@ async def _handle_ws_create(data: dict):
 async def _handle_ws_trade(data: dict):
     """
     Handle a live trade event from PumpPortal WS.
-    Data fields: mint, txType (buy/sell), tokenAmount, solAmount, traderPublicKey
+    Data fields: mint, txType (buy/sell), tokenAmount, solAmount, traderPublicKey,
+                 marketCapSol, vSolInBondingCurve (updated bonding-curve state after this trade)
     """
     mint = data.get("mint")
     if not mint or mint not in tokens:
@@ -1602,6 +1669,8 @@ async def _handle_ws_trade(data: dict):
 
     tx_type = data.get("txType", "")
     sol_amount = float(data.get("solAmount", 0) or 0)
+    mc_sol = float(data.get("marketCapSol", 0) or 0)
+    vsol_curve = float(data.get("vSolInBondingCurve", 0) or 0)
 
     ws_stats["trades_received"] += 1
     ws_stats["last_message_at"] = time.time()
@@ -1609,14 +1678,30 @@ async def _handle_ws_trade(data: dict):
     usd_amount = sol_amount * WS_SOL_PRICE_USD
 
     async with tokens_lock:
-        if mint in tokens:
-            tokens[mint].ws_sol_volume += sol_amount
+        t = tokens.get(mint)
+        if t:
+            t.ws_sol_volume += sol_amount
             if tx_type == "buy":
-                tokens[mint].ws_buy_count += 1
-                tokens[mint].ws_buy_vol_usd += usd_amount
+                t.ws_buy_count += 1
+                t.ws_buy_vol_usd += usd_amount
             elif tx_type == "sell":
-                tokens[mint].ws_sell_count += 1
-                tokens[mint].ws_sell_vol_usd += usd_amount
+                t.ws_sell_count += 1
+                t.ws_sell_vol_usd += usd_amount
+
+            # [v4.27] Keep market_cap/liquidity live for pre-graduation tokens.
+            # Once DexScreener actually enriches the token (t.liquidity becomes
+            # nonzero), defer to it as authoritative and stop overwriting from
+            # the bonding-curve estimate — DexScreener reflects real AMM state,
+            # the curve no longer determines price post-migration.
+            if t.liquidity == 0:
+                if mc_sol > 0:
+                    new_mc = mc_sol * WS_SOL_PRICE_USD
+                    update_mc_velocity(t, new_mc)
+                    t.market_cap = new_mc
+                if vsol_curve > 0:
+                    t.ws_liquidity_estimate = vsol_curve * WS_SOL_PRICE_USD
+
+            update_composite_score(t)
 
 
 async def pumpfun_ws_listener():
@@ -2317,13 +2402,18 @@ def format_gem_alert(token: TokenInfo, alert_reason: str = "GEM", distro: "Distr
         "VOL💰": "💰 Vol Spike", "VACCEL📊": "📊 Vol Accel", "KOL🐦": "🐦 KOL", "GEM": "💎 Gem",
     }
     signal_label = SIGNAL_LABELS.get(alert_reason, f"💎 {alert_reason}")
-    buy_pct = int(token.buy_ratio * 100)
+    # [v4.27] Same WS-derived fallback run_detections used to decide to alert —
+    # without it, a bonding-curve runner's card would misleadingly show $0
+    # Vol/Liq and a stale 50% buy bar even though real activity is what
+    # triggered the alert in the first place.
+    disp_liq, disp_vol, disp_buy_ratio = effective_liq_vol_buyratio(token)
+    buy_pct = int(disp_buy_ratio * 100)
     bp_filled = buy_pct // 10
     bp_bar = "█" * bp_filled + "░" * (10 - bp_filled)
 
     mc_s  = fmt_usd_short(token.market_cap)
-    vol_s = fmt_usd_short(token.volume_usd)
-    liq_s = fmt_usd_short(token.liquidity)
+    vol_s = fmt_usd_short(disp_vol)
+    liq_s = fmt_usd_short(disp_liq)
     txn_str = f"{token.buys_h1}B / {token.sells_h1}S" if (token.buys_h1 or token.sells_h1) else "—"
 
     # Signal badges (compact)
@@ -2660,8 +2750,18 @@ async def run_detections(token: TokenInfo, session: aiohttp.ClientSession = None
 
     if not token.alerted and now - token.last_alerted > GEM_COOLDOWN:
         mc = token.market_cap
-        vol = token.volume_usd
-        liq = token.liquidity
+
+        # [v4.27] Pre-graduation Solana bonding-curve fallback. DexScreener has
+        # no pair at all for a pump.fun token until it migrates off the curve —
+        # token.liquidity/volume_usd stay at their dataclass default (0.0)
+        # forever for such tokens, which made liq_ok/vol_ok permanently
+        # unsatisfiable regardless of how much the token was actually pumping
+        # on-curve. market_cap itself is fixed live by the WS trade handler
+        # (_handle_ws_trade); liq/vol/buy_ratio use WS-derived proxies here via
+        # effective_liq_vol_buyratio, but ONLY while token.liquidity == 0 (i.e.
+        # still unenriched) — once DexScreener actually reports real liquidity,
+        # that's authoritative and the fallback is skipped entirely.
+        liq, vol, live_buy_ratio = effective_liq_vol_buyratio(token)
 
         # [v4.10] Load per-chain thresholds
         th = get_thresholds(token.chain_id)
@@ -2681,8 +2781,11 @@ async def run_detections(token: TokenInfo, session: aiohttp.ClientSession = None
         liq_ok   = liq >= liq_min
 
         # ── Buy pressure gates ────────────────────────────────────────────
-        # Buy ratio: must be buys-dominant (filters dumps)
-        buy_ratio_ok = token.buy_ratio >= buy_ratio_min
+        # Buy ratio: must be buys-dominant (filters dumps). Uses the live
+        # WS-derived ratio pre-graduation (see fallback block above) once
+        # there's enough trade volume to trust it — otherwise the dataclass
+        # default of 0.5 would fail this gate for every brand-new token.
+        buy_ratio_ok = live_buy_ratio >= buy_ratio_min
         # Min buys: filters wash trading
         # [fix] buys_h1==0 means no data fetched yet — don't block on missing data
         min_buys_ok = token.buys_h1 >= min_buys_h1 or token.buys_h1 == 0
@@ -2841,7 +2944,7 @@ async def run_detections(token: TokenInfo, session: aiohttp.ClientSession = None
             if msg_id:
                 token.alert_message_id = msg_id  # store for reply-threading
             src = "⚡WS" if token.ws_discovered else "📡Poll"
-            buy_info = f"BR={token.buy_ratio:.0%} B1h={token.buys_h1}"
+            buy_info = f"BR={live_buy_ratio:.0%} B1h={token.buys_h1}"
             ws_info = f"WS={token.ws_buy_count}B/{token.ws_sell_count}S" if ws_total > 0 else ""
             distro_info = f"Top10={distro.top10_pct:.0f}%" if distro.data_available else "NoDistro"
             green_info = f"Green={token.consecutive_green_polls}polls"
@@ -3345,6 +3448,9 @@ async def polling_loop():
                                             tokens[mint].consecutive_green_polls += 1
                                         elif new_mc < tokens[mint].last_mc * 0.95:
                                             tokens[mint].consecutive_green_polls = 0
+                                        # [v4.27] Keep the eviction-ranking score live for
+                                        # polled (post-graduation / non-WS) tokens too.
+                                        update_composite_score(tokens[mint])
 
                             # [fix] use live tokens[mint] not stale local copy
                             async with tokens_lock:
