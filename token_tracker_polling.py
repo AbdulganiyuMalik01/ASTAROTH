@@ -164,6 +164,13 @@ ALCHEMY_WS_URLS = {
 # event signatures never change. Verified against live BscScan/Etherscan logs.
 _PAIR_CREATED_TOPIC = "0x0d3648bd0f6ba80134a33ba9275ac585d9d315f0ad8355cddefde31afa28d0e"  # PairCreated(address,address,address,uint256)
 _POOL_CREATED_TOPIC = "0x783cca1c0412dd0d695e784568c96da2e9c22ff989357a2e8b1d9b2b4e6b661"  # PoolCreated(address,address,uint24,int24,address)
+# [v4.28] Solidly-fork PoolCreated (Aerodrome on Base, Velodrome-style forks
+# elsewhere) — different signature than Uniswap V3's PoolCreated (adds an
+# indexed `stable` bool, drops fee/tickSpacing) so it needs its own topic0.
+# Computed via keccak256("PoolCreated(address,address,bool,address,uint256)")
+# and cross-verified against a live PoolCreated log on BaseScan
+# (tx 0x72e7300690df07a176ac65da67b86af0f744db818968f9ee445e3b89410ab344).
+_SOLIDLY_POOL_CREATED_TOPIC = "0x2128d88d14c80cb081c1252a5acff7a264671bf199ce226b53788fb26065005e"
 
 # Factory contracts to watch per chain. Addresses verified against BscScan /
 # Etherscan / BaseScan on 2026-08-22 — these are long-lived, canonical
@@ -181,6 +188,11 @@ EVM_FACTORIES = {
     ],
     "base": [
         {"address": "0x33128a8fC17869897dcE68Ed026d694621f6FDfD", "topic": _POOL_CREATED_TOPIC, "dex": "UniswapV3"},
+        # [v4.28] Aerodrome is Base's dominant DEX by volume/TVL — it was
+        # entirely unwatched before, which was a real chunk of why Base
+        # discovery lagged Solana's. Verified factory address + topic0
+        # against a live BaseScan PoolCreated log (see topic comment above).
+        {"address": "0x420DD381b31aEf6683db6B902084cB0FFECe40Da", "topic": _SOLIDLY_POOL_CREATED_TOPIC, "dex": "Aerodrome"},
     ],
 }
 
@@ -337,11 +349,15 @@ def _chain_thresholds(prefix: str, age_min, age_max, mc_min, mc_max,
         "min_buys_h1":   _env_num(f"{prefix}_MIN_BUYS_H1", min_buys_h1, int),
     }
 
+# [v4.28] Narrowed to a $10k-$30k MC catch window on every chain — this bot
+# is meant to catch tokens early, before they've already pumped past the
+# point where getting in is still worth it. mc_min/mc_max stay per-chain env
+# overridable (SOL_MC_MIN/SOL_MC_MAX etc.) in case one chain needs retuning.
 CHAIN_THRESHOLDS = {
-    "solana":   _chain_thresholds("SOL",  3 * 60,  6 * 3600, 10_000,     2_000_000, 0.15, 5_000, 0.52, 10),
-    "bsc":      _chain_thresholds("BSC",  2 * 60, 12 * 3600,  8_000,     5_000_000, 0.08, 5_000, 0.52, 8),
-    "base":     _chain_thresholds("BASE", 3 * 60,  6 * 3600, 10_000,     3_000_000, 0.10, 5_000, 0.52, 8),
-    "ethereum": _chain_thresholds("ETH",  2 * 60, 24 * 3600, 15_000,       500_000, 0.05, 5_000, 0.52, 3),
+    "solana":   _chain_thresholds("SOL",  3 * 60,  6 * 3600, 10_000,        30_000, 0.15, 5_000, 0.52, 10),
+    "bsc":      _chain_thresholds("BSC",  2 * 60, 12 * 3600, 10_000,        30_000, 0.08, 5_000, 0.52, 8),
+    "base":     _chain_thresholds("BASE", 3 * 60,  6 * 3600, 10_000,        30_000, 0.10, 5_000, 0.52, 8),
+    "ethereum": _chain_thresholds("ETH",  2 * 60, 24 * 3600, 10_000,        30_000, 0.05, 5_000, 0.52, 3),
 }
 
 def get_thresholds(chain_id: str) -> dict:
@@ -382,7 +398,7 @@ TOKENS_PER_POLL = 30
 GEM_AGE_MIN = 3 * 60           # 3 min — catch tokens as early as possible
 GEM_AGE_MAX = 6 * 3600         # 6 hours — runners can sustain longer than 90 min
 GEM_MC_MIN = 10_000            # lower floor — catch early before MC pumps
-GEM_MC_MAX = 2_000_000         # raised ceiling — don't miss mid-cap runners
+GEM_MC_MAX = 30_000            # [v4.28] narrowed catch window — only alert 10k-30k MC
 GEM_VOL_MC_RATIO = 0.15        # lowered — early tokens have lower vol/MC
 GEM_LIQUIDITY_MIN = 5_000      # lowered — young tokens have less liq
 GEM_COOLDOWN = 300             # 5 min cooldown (was 10) — faster re-alert on runners
@@ -392,8 +408,8 @@ GEM_BUY_RATIO_MIN = 0.52       # lowered from 0.60 — less strict buy dominance
 GEM_MIN_BUYS_H1 = 10           # lowered from 30 — catch early momentum
 GEM_WS_BUY_PRESSURE = 1.2     # lowered — alert sooner on buy pressure
 GEM_FAST_VELOCITY = 15.0       # lowered from 50% — easier to trigger fast-velocity path
-GEM_FAST_MC_MIN = 8_000        # lower MC floor for fast-velocity alert path
-GEM_VOL_ACCEL_MC_MAX = 500_000 # raised ceiling for vol-acceleration trigger
+GEM_FAST_MC_MIN = 10_000       # [v4.28] fast-velocity floor aligned to the 10k-30k catch window
+GEM_VOL_ACCEL_MC_MAX = 30_000  # [v4.28] vol-accel ceiling aligned to the 10k-30k catch window
 
 MULTIPLIER_MILESTONES = [2.0, 3.0, 5.0, 10.0]
 
@@ -2085,6 +2101,9 @@ async def evm_ws_listener(chain_id: str):
                                 pair_addr = "0x" + words[0][-40:]
                             elif topic0 == _POOL_CREATED_TOPIC and len(words) >= 2:
                                 pair_addr = "0x" + words[1][-40:]
+                            elif topic0 == _SOLIDLY_POOL_CREATED_TOPIC and words:
+                                # data = [pool, count] — same layout as PairCreated
+                                pair_addr = "0x" + words[0][-40:]
                             if pair_addr:
                                 evm_pair_meta[chain_id][pair_addr] = {
                                     "mint": new_token,
