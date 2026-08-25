@@ -349,15 +349,18 @@ def _chain_thresholds(prefix: str, age_min, age_max, mc_min, mc_max,
         "min_buys_h1":   _env_num(f"{prefix}_MIN_BUYS_H1", min_buys_h1, int),
     }
 
-# [v4.28] Narrowed to a $10k-$30k MC catch window on every chain — this bot
+# [v4.28] Narrowed to a $10k-$50k MC catch window on every chain — this bot
 # is meant to catch tokens early, before they've already pumped past the
-# point where getting in is still worth it. mc_min/mc_max stay per-chain env
-# overridable (SOL_MC_MIN/SOL_MC_MAX etc.) in case one chain needs retuning.
+# point where getting in is still worth it. (Started at a $30k ceiling;
+# raised to $50k after live data showed the tighter window intersected too
+# hard with the vol/buy-ratio/min-buys gates — too few tokens had time to
+# clear all of them before aging out of range.) mc_min/mc_max stay per-chain
+# env overridable (SOL_MC_MIN/SOL_MC_MAX etc.) in case one chain needs retuning.
 CHAIN_THRESHOLDS = {
-    "solana":   _chain_thresholds("SOL",  3 * 60,  6 * 3600, 10_000,        30_000, 0.15, 5_000, 0.52, 10),
-    "bsc":      _chain_thresholds("BSC",  2 * 60, 12 * 3600, 10_000,        30_000, 0.08, 5_000, 0.52, 8),
-    "base":     _chain_thresholds("BASE", 3 * 60,  6 * 3600, 10_000,        30_000, 0.10, 5_000, 0.52, 8),
-    "ethereum": _chain_thresholds("ETH",  2 * 60, 24 * 3600, 10_000,        30_000, 0.05, 5_000, 0.52, 3),
+    "solana":   _chain_thresholds("SOL",  3 * 60,  6 * 3600, 10_000,        50_000, 0.15, 5_000, 0.52, 10),
+    "bsc":      _chain_thresholds("BSC",  2 * 60, 12 * 3600, 10_000,        50_000, 0.08, 5_000, 0.52, 8),
+    "base":     _chain_thresholds("BASE", 3 * 60,  6 * 3600, 10_000,        50_000, 0.10, 5_000, 0.52, 8),
+    "ethereum": _chain_thresholds("ETH",  2 * 60, 24 * 3600, 10_000,        50_000, 0.05, 5_000, 0.52, 3),
 }
 
 def get_thresholds(chain_id: str) -> dict:
@@ -398,7 +401,7 @@ TOKENS_PER_POLL = 30
 GEM_AGE_MIN = 3 * 60           # 3 min — catch tokens as early as possible
 GEM_AGE_MAX = 6 * 3600         # 6 hours — runners can sustain longer than 90 min
 GEM_MC_MIN = 10_000            # lower floor — catch early before MC pumps
-GEM_MC_MAX = 30_000            # [v4.28] narrowed catch window — only alert 10k-30k MC
+GEM_MC_MAX = 50_000            # [v4.28] narrowed catch window — only alert 10k-50k MC
 GEM_VOL_MC_RATIO = 0.15        # lowered — early tokens have lower vol/MC
 GEM_LIQUIDITY_MIN = 5_000      # lowered — young tokens have less liq
 GEM_COOLDOWN = 300             # 5 min cooldown (was 10) — faster re-alert on runners
@@ -408,8 +411,8 @@ GEM_BUY_RATIO_MIN = 0.52       # lowered from 0.60 — less strict buy dominance
 GEM_MIN_BUYS_H1 = 10           # lowered from 30 — catch early momentum
 GEM_WS_BUY_PRESSURE = 1.2     # lowered — alert sooner on buy pressure
 GEM_FAST_VELOCITY = 15.0       # lowered from 50% — easier to trigger fast-velocity path
-GEM_FAST_MC_MIN = 10_000       # [v4.28] fast-velocity floor aligned to the 10k-30k catch window
-GEM_VOL_ACCEL_MC_MAX = 30_000  # [v4.28] vol-accel ceiling aligned to the 10k-30k catch window
+GEM_FAST_MC_MIN = 10_000       # [v4.28] fast-velocity floor aligned to the 10k-50k catch window
+GEM_VOL_ACCEL_MC_MAX = 50_000  # [v4.28] vol-accel ceiling aligned to the 10k-50k catch window
 
 MULTIPLIER_MILESTONES = [2.0, 3.0, 5.0, 10.0]
 
