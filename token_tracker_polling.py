@@ -3311,7 +3311,17 @@ async def run_detections(token: TokenInfo, session: aiohttp.ClientSession = None
             distro = DistroResult()  # default: passed=True
             if token.chain_id == "solana" and HELIUS_RPC:
                 try:
-                    import asyncio
+                    # [v4.31 fix] `asyncio` is already imported at module level
+                    # (top of file) — a local `import asyncio` here shadowed it
+                    # for this ENTIRE function (Python scoping: any name bound
+                    # anywhere in a function body, even inside an `if`, makes
+                    # that name local throughout the whole function). With
+                    # Solana disabled this branch never runs, so `asyncio` was
+                    # never locally bound, and the new alert_db logging call
+                    # below — a plain `asyncio.create_task(...)` — raised
+                    # "cannot access local variable 'asyncio'" on every single
+                    # alert. Removed the redundant local import; the module-
+                    # level one already covers this whole file.
                     distro = await asyncio.wait_for(
                         check_distro_and_bundle(session, token.mint, token.created_at),
                         timeout=DISTRO_TIMEOUT + 1
