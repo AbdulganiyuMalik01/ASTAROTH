@@ -219,6 +219,69 @@ EVM_FACTORIES = {
     ],
 }
 
+# ============================================================================
+# [v4.35] four.meme -- BSC's dominant pump.fun-style bonding-curve launchpad.
+# ============================================================================
+# The gap this closes: our only BSC discovery was PancakeV2/V3 pair-creation
+# events, which only fire once a token MIGRATES off a bonding curve onto a
+# real Pancake pair -- exactly like pump.fun tokens don't hit a DexScreener
+# pair until graduation. A large share of BSC "runner" activity happens
+# *during* the four.meme bonding-curve phase, entirely invisible to that
+# factory watch. This adds a second, address-filtered logs subscription on
+# the SAME Alchemy BSC WS connection for TokenManager2's TokenCreate /
+# TokenPurchase / TokenSale events.
+#
+# Contract address and event ABI cross-verified across three independent
+# sources before writing a single line of decode logic (same rigor as the
+# earlier topic0 fix this session, precisely because this failure mode is
+# silent): Bitquery's four.meme API docs, a QuickNode BSC copytrading guide,
+# and -- most authoritative -- the four-meme-community/fourmeme-docs GitHub
+# repo's own machine-generated ABI JSON (abi/TokenManager2.lite.json) and
+# Solidity interface (contracts/interfaces/ITokenManager2.sol), which
+# explicitly show "indexed": false / no `indexed` keyword on every single
+# event parameter -- meaning NONE of these events can be filtered by topic
+# beyond topic0; every field must be decoded from `data`. Topic0 hashes were
+# then independently recomputed here via keccak256 of the canonical
+# signatures and matched byte-for-byte against the value reported by two of
+# the three sources above.
+#
+# What this deliberately does NOT do: estimate a real USD market cap from
+# four.meme's `price` field. Their own docs explicitly scope out "bonding-
+# curve algorithms" as proprietary/undocumented, so there's no verified
+# fixed-point convention to trust (unlike Solana pump.fun, where a published
+# IDL make computing a real MC possible). Instead it tracks cumulative BNB
+# raised (TokenInfo.fourmeme_raised_usd) as a curve-progress proxy, feeding
+# a separate CURVE🌊 alert path in run_detections that never touches or
+# mixes with the real-dollar-MC-gated paths every other signal uses.
+FOURMEME_TOKEN_MANAGER2 = "0x5c952063c7fc8610ffdb798152d69f0b9550762b"  # BSC, TokenManager2 (V2 -- current launches)
+# keccak256("TokenCreate(address,address,uint256,string,string,uint256,uint256,uint256)")
+_FOURMEME_CREATE_TOPIC = "0x396d5e902b675b032348d3d2e9517ee8f0c4a926603fbc075d3d282ff00cad20"
+# keccak256("TokenPurchase(address,address,uint256,uint256,uint256,uint256,uint256,uint256)")
+_FOURMEME_PURCHASE_TOPIC = "0x7db52723a3b2cdd6164364b3b766e65e540d7be48ffa89582956d8eaebe62942"
+# keccak256("TokenSale(address,address,uint256,uint256,uint256,uint256,uint256,uint256)")
+_FOURMEME_SALE_TOPIC = "0x0a5575b3648bae2210cee56bf33254cc1ddfbc7bf637c0af2ac18b14fb1bae19"
+
+# FOURMEME_MODE mirrors PUMPFUN_DIRECT_MODE's off/shadow/live rollout pattern
+# from earlier this session -- same reasoning: a brand-new decoder for a
+# numeric proxy (fourmeme_raised_usd) that can't be verified against live
+# chain data from this environment shouldn't default to feeding real alerts.
+#   off    (default) -- four.meme subscription not started. Zero behavior change.
+#   shadow -- decodes and logs CREATE/BUY/SELL events (see fourmeme_stats via
+#             /status) but does not touch `tokens` or fire alerts. Use this
+#             to sanity-check decoded symbols/names/raised-amounts against
+#             the real four.meme.com site or BscScan before trusting it.
+#   live   -- creates a real pre-enrichment TokenInfo stub per new token,
+#             tracks live buy/sell pressure, and can fire the CURVE🌊 path.
+FOURMEME_MODE = os.getenv("FOURMEME_MODE", "off").strip().lower()
+FOURMEME_GRADUATION_BNB = 24.0  # fixed platform raise target (documented, not customizable)
+FOURMEME_MIN_RAISED_USD = float(os.getenv("FOURMEME_MIN_RAISED_USD", "2000"))
+FOURMEME_MAX_RAISED_USD = float(os.getenv("FOURMEME_MAX_RAISED_USD", "12000"))
+fourmeme_stats = {
+    "connected": False, "creates_decoded": 0, "purchases_decoded": 0,
+    "sales_decoded": 0, "decode_errors": 0, "tokens_tracked": 0, "curve_alerts": 0,
+}
+fourmeme_sub_id: Dict[str, Optional[str]] = {}  # only "bsc" key ever used
+
 # The "other side" of a pair — when a factory event fires, whichever token is
 # NOT one of these is the new listing. If neither side matches (two unknown
 # tokens paired together) we fall back to token0 as a best-effort guess.
@@ -813,6 +876,16 @@ class TokenInfo:
     # field ever actually set, so every eviction candidate silently tied at
     # 0.0 and enforce_token_cap degraded to pure oldest-first eviction.
     composite_score: float = 0.0
+    # [v4.35] four.meme (BSC bonding-curve launchpad) curve-progress proxy.
+    # Deliberately NOT market_cap -- four.meme's actual bonding-curve pricing
+    # formula isn't published anywhere verifiable, so unlike the Solana
+    # pump.fun direct indexer (which computes a real MC from a documented
+    # IDL), there's no trustworthy way to turn their `price` field into a
+    # real USD market cap here. This holds cumulative BNB raised (a real,
+    # decimal-safe number straight off the TokenPurchase/TokenSale events),
+    # used only by the separate CURVE🌊 path in run_detections -- it can
+    # never reach or be confused with the real-dollar-MC-gated paths.
+    fourmeme_raised_usd: float = 0.0
 
 tokens: Dict[str, TokenInfo] = {}
 tokens_lock = asyncio.Lock()
@@ -1008,6 +1081,16 @@ def effective_liq_vol_buyratio(token: TokenInfo) -> tuple:
     if token.chain_id == "solana" and token.liquidity == 0:
         ws_total = token.ws_buy_count + token.ws_sell_count
         liq = token.ws_liquidity_estimate
+        vol = token.ws_buy_vol_usd + token.ws_sell_vol_usd
+        buy_ratio = token.ws_buy_count / max(ws_total, 1) if ws_total >= 5 else token.buy_ratio
+        return liq, vol, buy_ratio
+    # [v4.35] Same fallback for a BSC four.meme pre-migration stub — real
+    # buy/sell counts exist (from TokenPurchase/TokenSale), just no
+    # DexScreener liquidity/volume yet. Uses fourmeme_raised_usd (cumulative
+    # BNB raised) as the liquidity proxy — NOT market_cap, see TokenInfo.
+    if token.chain_id == "bsc" and token.ws_pre_enrichment and token.liquidity == 0:
+        ws_total = token.ws_buy_count + token.ws_sell_count
+        liq = token.fourmeme_raised_usd
         vol = token.ws_buy_vol_usd + token.ws_sell_vol_usd
         buy_ratio = token.ws_buy_count / max(ws_total, 1) if ws_total >= 5 else token.buy_ratio
         return liq, vol, buy_ratio
@@ -2599,6 +2682,182 @@ def _log_data_words(log: dict) -> List[str]:
     return [data_hex[i:i + 64] for i in range(0, len(data_hex), 64)]
 
 
+# [v4.35] Minimal, dependency-free ABI decoding for four.meme's TokenManager2
+# events -- every param is non-indexed (verified, see the FOURMEME_MODE
+# comment block above), so everything lives in `data` as a standard Solidity
+# ABI tuple encoding: one 32-byte "head" word per param in order (a dynamic
+# `string` param's head word is a byte-offset pointer instead of its value),
+# followed by a "tail" section holding each dynamic param's length + content.
+# No new dependency (web3/eth_abi) needed for the handful of fixed shapes
+# actually used here -- same philosophy as this file's existing borsh
+# decoder for Solana's pump.fun Anchor events.
+def _abi_word_addr(word_hex: str) -> str:
+    """A 32-byte address word is left-zero-padded — value is the rightmost 20 bytes."""
+    return "0x" + word_hex[-40:]
+
+
+def _abi_word_uint(word_hex: str) -> int:
+    return int(word_hex, 16) if word_hex else 0
+
+
+def _abi_dyn_string(words: List[str], byte_offset: int) -> str:
+    """Read a dynamic `string` param given its head-word byte offset (offset
+    is measured from the start of `data`, so word index = offset // 32)."""
+    word_idx = byte_offset // 32
+    if word_idx < 0 or word_idx >= len(words):
+        return ""
+    length = _abi_word_uint(words[word_idx])
+    n_words = (length + 31) // 32
+    content_hex = "".join(words[word_idx + 1: word_idx + 1 + n_words])
+    try:
+        return bytes.fromhex(content_hex)[:length].decode("utf-8", errors="replace")
+    except Exception:
+        return ""
+
+
+def _decode_fourmeme_create(log: dict) -> Optional[dict]:
+    """
+    TokenCreate(address creator, address token, uint256 requestId,
+                string name, string symbol, uint256 totalSupply,
+                uint256 launchTime, uint256 launchFee)
+    8 head words; name/symbol are dynamic (offset pointers in their head slot).
+    """
+    words = _log_data_words(log)
+    if len(words) < 8:
+        return None
+    try:
+        return {
+            "creator": _abi_word_addr(words[0]),
+            "token": _abi_word_addr(words[1]),
+            "request_id": _abi_word_uint(words[2]),
+            "name": _abi_dyn_string(words, _abi_word_uint(words[3])),
+            "symbol": _abi_dyn_string(words, _abi_word_uint(words[4])),
+            "total_supply": _abi_word_uint(words[5]),
+            "launch_time": _abi_word_uint(words[6]),
+            "launch_fee": _abi_word_uint(words[7]),
+        }
+    except Exception:
+        return None
+
+
+def _decode_fourmeme_trade(log: dict) -> Optional[dict]:
+    """
+    TokenPurchase / TokenSale (V2, identical shape):
+    (address token, address account, uint256 price, uint256 amount,
+     uint256 cost, uint256 fee, uint256 offers, uint256 funds)
+    All 8 params are static (no strings) -- straight positional decode.
+    """
+    words = _log_data_words(log)
+    if len(words) < 8:
+        return None
+    try:
+        return {
+            "token": _abi_word_addr(words[0]),
+            "account": _abi_word_addr(words[1]),
+            "price": _abi_word_uint(words[2]),
+            "amount": _abi_word_uint(words[3]),
+            "cost": _abi_word_uint(words[4]),
+            "fee": _abi_word_uint(words[5]),
+            "offers": _abi_word_uint(words[6]),
+            "funds": _abi_word_uint(words[7]),
+        }
+    except Exception:
+        return None
+
+
+_FOURMEME_WBNB = "0xbb4cdb9cbd36b01bd1cbaebf2de08d9173bc095c"  # BSC WBNB — four.meme's default raise asset
+
+
+async def _handle_fourmeme_log(log: dict) -> None:
+    """
+    Routes a four.meme TokenManager2 log to the right decoder by topic0, then
+    either logs it (shadow mode) or feeds it into live tracking. See the
+    FOURMEME_MODE comment block above for the off/shadow/live rollout design
+    and why fourmeme_raised_usd — not market_cap — is what gets updated here.
+    """
+    topics = log.get("topics", [])
+    if not topics:
+        return
+    topic0 = topics[0].lower()
+
+    if topic0 == _FOURMEME_CREATE_TOPIC:
+        info = _decode_fourmeme_create(log)
+        if not info or not info.get("token"):
+            fourmeme_stats["decode_errors"] += 1
+            return
+        fourmeme_stats["creates_decoded"] += 1
+        mint = info["token"].lower()
+
+        if FOURMEME_MODE == "shadow":
+            logger.info(
+                f"🌊 [shadow] four.meme CREATE ${info['symbol']} ({info['name']}) "
+                f"{mint[:10]}... supply_raw={info['total_supply']}"
+            )
+            return
+
+        if mint in tokens or len(tokens) >= MAX_TRACKED_TOKENS:
+            return
+        async with tokens_lock:
+            if mint not in tokens:
+                tokens[mint] = TokenInfo(
+                    mint=mint, symbol=(info["symbol"] or "???")[:20],
+                    name=(info["name"] or "")[:64], created_at=time.time(),
+                    chain_id="bsc", ws_discovered=True, ws_pre_enrichment=True,
+                )
+        fourmeme_stats["tokens_tracked"] += 1
+        logger.info(f"🌊 four.meme NEW: ${info['symbol']} ({mint[:10]}...)")
+
+        # Also queue through the normal WS-discovery enrichment pipeline —
+        # if/when this token migrates to Pancake (or DexScreener otherwise
+        # indexes it), _finalize_ws_token upgrades this exact stub in place
+        # with real dex_data, exactly like any other WS-discovered token.
+        # Deliberately NOT added to `seen_mints`: that set exists to dedupe
+        # the PancakeV2/V3 factory watch, and this token's eventual real
+        # migration pair-creation event should still reach that path
+        # normally (this queue push alone gives up after ~1 minute if the
+        # curve hasn't migrated yet — bonding curves often run far longer).
+        if ws_discovery_queue is not None:
+            await ws_discovery_queue.put({
+                "mint": mint, "symbol": info["symbol"] or "???",
+                "name": info["name"] or "", "chain_id": "bsc",
+                "created_at": time.time(), "ws_discovered": True,
+                "ws_initial_buy_sol": 0.0, "mc_sol_at_creation": 0.0,
+            })
+        return
+
+    if topic0 not in (_FOURMEME_PURCHASE_TOPIC, _FOURMEME_SALE_TOPIC):
+        return
+
+    trade = _decode_fourmeme_trade(log)
+    if not trade or not trade.get("token"):
+        fourmeme_stats["decode_errors"] += 1
+        return
+    mint = trade["token"].lower()
+    is_buy = topic0 == _FOURMEME_PURCHASE_TOPIC
+    fourmeme_stats["purchases_decoded" if is_buy else "sales_decoded"] += 1
+
+    cost_usd = _evm_amount_to_usd("bsc", _FOURMEME_WBNB, trade["cost"])
+    funds_usd = _evm_amount_to_usd("bsc", _FOURMEME_WBNB, trade["funds"])
+
+    if FOURMEME_MODE == "shadow":
+        logger.debug(
+            f"🌊 [shadow] four.meme {'BUY' if is_buy else 'SELL'} {mint[:10]}... "
+            f"cost=${cost_usd:,.0f} raised=${funds_usd:,.0f}"
+        )
+        return
+
+    if mint not in tokens:
+        return  # not a token we're tracking (e.g. subscription started mid-curve)
+    token = tokens[mint]
+    token.fourmeme_raised_usd = funds_usd
+    if is_buy:
+        token.ws_buy_count += 1
+        token.ws_buy_vol_usd += cost_usd
+    else:
+        token.ws_sell_count += 1
+        token.ws_sell_vol_usd += cost_usd
+
+
 async def _handle_evm_swap_log(chain_id: str, log: dict) -> None:
     """
     Decode a Swap event (V2 In/Out style or V3 signed-delta style) on a pair
@@ -2781,6 +3040,7 @@ async def evm_ws_listener(chain_id: str):
                 evm_swap_subscribed[chain_id] = set()
                 evm_swap_sub_id[chain_id] = None
                 evm_factory_sub_id[chain_id] = None
+                fourmeme_sub_id[chain_id] = None
 
                 await ws.send(json.dumps({
                     "jsonrpc": "2.0",
@@ -2790,6 +3050,20 @@ async def evm_ws_listener(chain_id: str):
                 }))
 
                 resub_task = asyncio.create_task(_refresh_evm_swap_subs(ws, chain_id))
+
+                # [v4.35] four.meme -- third subscription, BSC only, off by default
+                if chain_id == "bsc" and FOURMEME_MODE != "off":
+                    await ws.send(json.dumps({
+                        "jsonrpc": "2.0",
+                        "id": 3,
+                        "method": "eth_subscribe",
+                        "params": ["logs", {
+                            "address": FOURMEME_TOKEN_MANAGER2,
+                            "topics": [[_FOURMEME_CREATE_TOPIC, _FOURMEME_PURCHASE_TOPIC, _FOURMEME_SALE_TOPIC]],
+                        }],
+                    }))
+                    fourmeme_stats["connected"] = True
+                    logger.info(f"🌊 four.meme WS subscribed [{FOURMEME_MODE}]")
 
                 async for message in ws:
                     try:
@@ -2803,6 +3077,8 @@ async def evm_ws_listener(chain_id: str):
                                 evm_factory_sub_id[chain_id] = data["result"]
                             elif req_id == 2:
                                 evm_swap_sub_id[chain_id] = data["result"]
+                            elif req_id == 3:
+                                fourmeme_sub_id[chain_id] = data["result"]
                             continue
 
                         params = data.get("params") or {}
@@ -2810,10 +3086,13 @@ async def evm_ws_listener(chain_id: str):
                         if not log:
                             continue
 
-                        # Route by subscription id — swap feed vs factory feed
+                        # Route by subscription id — swap feed vs factory feed vs four.meme
                         sub_id = params.get("subscription")
                         if sub_id is not None and sub_id == evm_swap_sub_id.get(chain_id):
                             await _handle_evm_swap_log(chain_id, log)
+                            continue
+                        if sub_id is not None and sub_id == fourmeme_sub_id.get(chain_id):
+                            await _handle_fourmeme_log(log)
                             continue
 
                         log_topics = log.get("topics", [])
@@ -3178,6 +3457,7 @@ def format_gem_alert(token: TokenInfo, alert_reason: str = "GEM", distro: "Distr
         "FAST🔥": "⚡ Fast Runner", "EARLY📈": "📈 Early Entry",
         "VOL💰": "💰 Vol Spike", "VACCEL📊": "📊 Vol Accel", "KOL🐦": "🐦 KOL", "GEM": "💎 Gem",
         "RUNNER🚀": "🚀 Runner (already running)",
+        "CURVE🌊": "🌊 four.meme Curve",
     }
     signal_label = SIGNAL_LABELS.get(alert_reason, f"💎 {alert_reason}")
     # [v4.27] Same WS-derived fallback run_detections used to decide to alert —
@@ -3189,7 +3469,13 @@ def format_gem_alert(token: TokenInfo, alert_reason: str = "GEM", distro: "Distr
     bp_filled = buy_pct // 10
     bp_bar = "█" * bp_filled + "░" * (10 - bp_filled)
 
-    mc_s  = fmt_usd_short(token.market_cap)
+    # [v4.35] four.meme pre-migration stubs have no real market_cap (see
+    # TokenInfo.fourmeme_raised_usd) — show the curve-progress number instead
+    # of a misleading "MC $0".
+    if alert_reason == "CURVE🌊":
+        mc_s = f"{fmt_usd_short(token.fourmeme_raised_usd)} raised (of ~{FOURMEME_GRADUATION_BNB:.0f} BNB curve)"
+    else:
+        mc_s = fmt_usd_short(token.market_cap)
     vol_s = fmt_usd_short(disp_vol)
     liq_s = fmt_usd_short(disp_liq)
     txn_str = f"{token.buys_h1}B / {token.sells_h1}S" if (token.buys_h1 or token.sells_h1) else "—"
@@ -3208,7 +3494,11 @@ def format_gem_alert(token: TokenInfo, alert_reason: str = "GEM", distro: "Distr
     if distro and distro.data_available: badges.append(format_distro_line(distro))
 
     # Chain-specific links
-    if token.chain_id == "solana":
+    if alert_reason == "CURVE🌊":
+        # Pre-migration four.meme token — no DexScreener pair exists yet,
+        # a dexscreener.com link here would just 404.
+        links = f"<a href='https://four.meme/token/{token.mint}'>four.meme</a> · <a href='https://bscscan.com/token/{token.mint}'>Scan</a>"
+    elif token.chain_id == "solana":
         links = f"<a href='{_dex_url}'>DEX</a> · <a href='https://pump.fun/{token.mint}'>Pump</a>"
     elif token.chain_id == "bsc":
         links = f"<a href='{_dex_url}'>DEX</a> · <a href='https://dextools.io/app/en/bnb/pair-explorer/{token.mint}'>Tools</a>"
@@ -3704,6 +3994,22 @@ async def run_detections(token: TokenInfo, session: aiohttp.ClientSession = None
             and price_not_crashing and mc_not_collapsed and not_suppressed
         )
 
+        # ── [v4.35] four.meme curve-momentum path (BSC bonding-curve, pre-migration) ──
+        # Uses fourmeme_raised_usd (real BNB raised, decimal-safe) instead of
+        # token.market_cap, which is intentionally left at 0 for these stubs
+        # (see FOURMEME_MODE comment block / TokenInfo.fourmeme_raised_usd) --
+        # this can never collide with the mc_min/mc_max-gated paths above.
+        fourmeme_curve_running = False
+        if (token.chain_id == "bsc" and token.ws_pre_enrichment
+                and token.fourmeme_raised_usd > 0):
+            ws_total_fm = token.ws_buy_count + token.ws_sell_count
+            fourmeme_curve_running = (
+                FOURMEME_MIN_RAISED_USD <= token.fourmeme_raised_usd <= FOURMEME_MAX_RAISED_USD
+                and ws_total_fm >= 5
+                and token.ws_buy_count / max(token.ws_sell_count, 1) >= GEM_WS_BUY_PRESSURE
+                and not_suppressed
+            )
+
         alert_reason = None
         if standard:
             alert_reason = "GEM"
@@ -3717,6 +4023,9 @@ async def run_detections(token: TokenInfo, session: aiohttp.ClientSession = None
             alert_reason = "VACCEL📊"
         elif momentum_running:
             alert_reason = "RUNNER🚀"
+        elif fourmeme_curve_running:
+            alert_reason = "CURVE🌊"
+            fourmeme_stats["curve_alerts"] += 1
 
         if alert_reason:
             # [v4.10] Distribution + bundle check (Solana only, non-blocking)
@@ -4447,6 +4756,7 @@ async def status():
         "gems_alerted": sum(1 for t in tokens.values() if t.alerted),
         "ws": ws_stats,
         "pumpfun_direct": pumpfun_direct_stats if PUMPFUN_DIRECT_MODE != "off" else None,
+        "fourmeme": {**fourmeme_stats, "mode": FOURMEME_MODE} if FOURMEME_MODE != "off" else None,
         "kol": {**kol_stats, "accounts": len(kol_accounts)},
         "evm_ws": {cid: s for cid, s in evm_ws_stats.items() if get_chain(cid)["has_ws"]},
         "squat_guard": {
