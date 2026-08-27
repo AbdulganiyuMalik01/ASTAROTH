@@ -397,11 +397,29 @@ def _chain_thresholds(prefix: str, age_min, age_max, mc_min, mc_max,
 # Ethereum's min_buys_h1 stays at 3 (already the lowest — ETH's low tx
 # velocity means further lowering risks quality, not just volume) and
 # solana's thresholds are untouched/dormant while ENABLE_SOLANA=false.
+#
+# [v4.34] "Balanced" tuning pass, aimed at catching more runners without
+# gutting the anti-dump/distro safety nets. Reasoning: with Solana back on
+# and the new RUNNER momentum path (below) absorbing anything that outgrows
+# this window, these thresholds only gate the "catch it cheap" phase, so
+# there's real room to relax them a notch further than v4.30 did:
+#   - buy_ratio_min: -0.03 across the board (0.52->0.50 solana, 0.48->0.45
+#     bsc/base/eth) — still requires clear buy dominance, just not quite as
+#     strict, so tokens qualify a little earlier in their run.
+#   - min_buys_h1: -1 to -2 per chain (solana 10->8, bsc/base 6->5, eth
+#     3->2) — eth stays the most conservative since its low tx velocity
+#     makes small buy counts less statistically meaningful, but 2 vs 3 is a
+#     minor move, not a quality cliff.
+#   - vol_mc_ratio: ~20-25% relative reduction per chain — the vol/MC ratio
+#     gate was tuned when the catch window was narrower; a slightly lower
+#     bar still filters genuinely dead tokens while not excluding early
+#     movers whose volume hasn't caught up to their MC yet.
+# All still per-chain env-overridable if any of these need dialing back.
 CHAIN_THRESHOLDS = {
-    "solana":   _chain_thresholds("SOL",  3 * 60,  6 * 3600, 10_000,        50_000, 0.15, 5_000, 0.52, 10),
-    "bsc":      _chain_thresholds("BSC",  2 * 60, 12 * 3600, 10_000,        50_000, 0.08, 5_000, 0.48, 6),
-    "base":     _chain_thresholds("BASE", 3 * 60,  6 * 3600, 10_000,        50_000, 0.10, 5_000, 0.48, 6),
-    "ethereum": _chain_thresholds("ETH",  2 * 60, 24 * 3600, 10_000,        50_000, 0.05, 5_000, 0.48, 3),
+    "solana":   _chain_thresholds("SOL",  3 * 60,  6 * 3600, 10_000,        50_000, 0.12, 5_000, 0.50, 8),
+    "bsc":      _chain_thresholds("BSC",  2 * 60, 12 * 3600, 10_000,        50_000, 0.06, 5_000, 0.45, 5),
+    "base":     _chain_thresholds("BASE", 3 * 60,  6 * 3600, 10_000,        50_000, 0.08, 5_000, 0.45, 5),
+    "ethereum": _chain_thresholds("ETH",  2 * 60, 24 * 3600, 10_000,        50_000, 0.04, 5_000, 0.45, 2),
 }
 
 def get_thresholds(chain_id: str) -> dict:
@@ -496,6 +514,23 @@ GEM_WS_BUY_PRESSURE = 1.2     # lowered — alert sooner on buy pressure
 GEM_FAST_VELOCITY = 15.0       # lowered from 50% — easier to trigger fast-velocity path
 GEM_FAST_MC_MIN = 10_000       # [v4.28] fast-velocity floor aligned to the 10k-50k catch window
 GEM_VOL_ACCEL_MC_MAX = 50_000  # [v4.28] vol-accel ceiling aligned to the 10k-50k catch window
+
+# [v4.34] Every path above requires mc <= mc_max (the ~$50k "catch it cheap"
+# ceiling) — which structurally means NONE of them can ever fire on a token
+# that already broke past that ceiling while running, no matter how strong
+# its current buy pressure is. That's backwards for a bot whose whole job is
+# to catch runners: a real runner, by definition, often blows through $50k
+# in its first minute or two -- faster than buy_ratio/min_buys/vol_ratio can
+# accumulate enough data to clear their gates. This is a SEPARATE, additive
+# path (see `momentum_running` in run_detections) for tokens already above
+# mc_max but still showing strong, currently-accelerating buy pressure -- it
+# does not touch or loosen any existing path, it just stops silently
+# dropping the tokens all the other paths are structurally blind to.
+# GEM_MOMENTUM_MC_MAX is a sanity ceiling, not a "still cheap" window --
+# picked high enough to not exclude a real still-running token, low enough
+# to not alert on tokens that are just large/established (RESURGENCE_MODE
+# already covers "established token regaining volume" as its own category).
+GEM_MOMENTUM_MC_MAX = float(os.getenv("GEM_MOMENTUM_MC_MAX", "2000000"))  # $2M sanity ceiling
 
 MULTIPLIER_MILESTONES = [2.0, 3.0, 5.0, 10.0]
 
@@ -3142,6 +3177,7 @@ def format_gem_alert(token: TokenInfo, alert_reason: str = "GEM", distro: "Distr
     SIGNAL_LABELS = {
         "FAST🔥": "⚡ Fast Runner", "EARLY📈": "📈 Early Entry",
         "VOL💰": "💰 Vol Spike", "VACCEL📊": "📊 Vol Accel", "KOL🐦": "🐦 KOL", "GEM": "💎 Gem",
+        "RUNNER🚀": "🚀 Runner (already running)",
     }
     signal_label = SIGNAL_LABELS.get(alert_reason, f"💎 {alert_reason}")
     # [v4.27] Same WS-derived fallback run_detections used to decide to alert —
@@ -3599,7 +3635,12 @@ async def run_detections(token: TokenInfo, session: aiohttp.ClientSession = None
             and GEM_FAST_MC_MIN <= mc <= GEM_VOL_ACCEL_MC_MAX
             and liq_ok
             and buy_ratio_ok
-            and token.buys_h1 >= max(min_buys_h1 // 2, 10)
+            # [v4.34 fix] was a hardcoded floor of 10 regardless of chain --
+            # for bsc/base/eth (min_buys_h1 now 5/5/2 after this session's
+            # loosening pass) that floor was HIGHER than the chain's own
+            # full standard-path threshold, silently overriding the tuning
+            # above for this path specifically. Scale with the chain instead.
+            and token.buys_h1 >= max(min_buys_h1 // 2, 3)
             and price_not_crashing and mc_not_collapsed and not_suppressed
         )
 
@@ -3636,6 +3677,33 @@ async def run_detections(token: TokenInfo, session: aiohttp.ClientSession = None
             and age_s <= age_max
         )
 
+        # ── [v4.34] Momentum path: catch tokens already running past mc_max ──
+        # Every path above requires mc <= mc_max (~$50k) -- meaning a token
+        # that already broke past that ceiling on real, current buy pressure
+        # was previously invisible to every single alert path, no matter how
+        # strong its signal. This path is intentionally disjoint from all of
+        # them (mc > mc_max), so it only ever catches what they structurally
+        # couldn't -- it doesn't loosen or duplicate any existing behavior.
+        # Deliberately stricter than the "catch it cheap" paths on the one
+        # axis that matters here (evidence of CURRENT acceleration, not just
+        # a healthy ratio) since there's no age/MC cheapness gate doing any
+        # of that filtering for us at this size.
+        momentum_running = (
+            mc > mc_max
+            and mc <= GEM_MOMENTUM_MC_MAX
+            and age_s <= age_max
+            and vol_ok
+            and liq_ok
+            and buy_ratio_ok
+            and min_buys_ok
+            and (
+                token.mc_velocity >= GEM_FAST_VELOCITY
+                or is_vol_accelerating(token)
+                or (token.chain_id in ("ethereum", "bsc", "base") and is_buy_vol_accelerating(token))
+            )
+            and price_not_crashing and mc_not_collapsed and not_suppressed
+        )
+
         alert_reason = None
         if standard:
             alert_reason = "GEM"
@@ -3647,6 +3715,8 @@ async def run_detections(token: TokenInfo, session: aiohttp.ClientSession = None
             alert_reason = "VOL💰"
         elif eth_vol_accel:
             alert_reason = "VACCEL📊"
+        elif momentum_running:
+            alert_reason = "RUNNER🚀"
 
         if alert_reason:
             # [v4.10] Distribution + bundle check (Solana only, non-blocking)
