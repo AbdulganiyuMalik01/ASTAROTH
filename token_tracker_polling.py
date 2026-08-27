@@ -595,6 +595,16 @@ GEM_VOL_ACCEL_MC_MAX = 50_000  # [v4.28] vol-accel ceiling aligned to the 10k-50
 # already covers "established token regaining volume" as its own category).
 GEM_MOMENTUM_MC_MAX = float(os.getenv("GEM_MOMENTUM_MC_MAX", "2000000"))  # $2M sanity ceiling
 
+# [v4.36] FRESH🌱 path — real on-chain buy pressure on a vanilla EVM DEX pair
+# (PancakeV2/V3, Uniswap, Sushi, Aerodrome) that DexScreener hasn't indexed
+# yet. See the pre-track stub in evm_ws_listener and the matching gate in
+# run_detections. No liquidity/MC data exists for these stubs (no proxy like
+# a bonding curve's raised amount — a PairCreated event carries no reserves),
+# so this requires a real dollar floor and real trade-count floor on the raw
+# WS-derived swap counters instead, to keep it from firing on dust.
+EVM_FRESH_MIN_TRADES = int(os.getenv("EVM_FRESH_MIN_TRADES", "8"))
+EVM_FRESH_MIN_USD_VOL = float(os.getenv("EVM_FRESH_MIN_USD_VOL", "1000"))
+
 MULTIPLIER_MILESTONES = [2.0, 3.0, 5.0, 10.0]
 
 # Token pool management
@@ -765,9 +775,11 @@ ws_stats = {
 }
 
 # [v4.25] Alchemy WS stats — one entry per EVM chain with has_ws enabled
+# [v4.36] pre_tracked / fresh_alerts added — see the pre-track stub added in
+# evm_ws_listener and the FRESH🌱 path in run_detections.
 evm_ws_stats: Dict[str, dict] = {
     cid: {"connected": False, "reconnects": 0, "pairs_discovered": 0, "last_message_at": 0.0,
-          "trades_received": 0, "swap_subs": 0}
+          "trades_received": 0, "swap_subs": 0, "pre_tracked": 0, "fresh_alerts": 0}
     for cid in ("bsc", "base", "ethereum")
 }
 
@@ -1094,6 +1106,17 @@ def effective_liq_vol_buyratio(token: TokenInfo) -> tuple:
         vol = token.ws_buy_vol_usd + token.ws_sell_vol_usd
         buy_ratio = token.ws_buy_count / max(ws_total, 1) if ws_total >= 5 else token.buy_ratio
         return liq, vol, buy_ratio
+    # [v4.36] Generic pre-DexScreener-index fallback for vanilla EVM DEX pairs
+    # (PancakeV2/V3, Uniswap, Sushi, Aerodrome — see the pre-track stub added
+    # in evm_ws_listener). Unlike Solana/four.meme there's no liquidity proxy
+    # available (a PairCreated event carries no reserves), so liq stays 0 —
+    # but vol/buy_ratio come from real WS swap counters instead of sitting at
+    # the dataclass default (0 / 0.5) for the whole pre-enrichment window.
+    if token.ws_pre_enrichment and token.liquidity == 0:
+        ws_total = token.ws_buy_count + token.ws_sell_count
+        vol = token.ws_buy_vol_usd + token.ws_sell_vol_usd
+        buy_ratio = token.ws_buy_count / max(ws_total, 1) if ws_total >= 5 else token.buy_ratio
+        return token.liquidity, vol, buy_ratio
     return token.liquidity, token.volume_usd, token.buy_ratio
 
 
@@ -3121,9 +3144,9 @@ async def evm_ws_listener(chain_id: str):
 
                         # Record pair metadata (needed by the swap feed) only when
                         # we recognize the base-token side well enough to price it.
+                        pair_addr = None
                         if base_token_addr in base_token_decimals:
                             words = _log_data_words(log)
-                            pair_addr = None
                             if topic0 == _PAIR_CREATED_TOPIC and words:
                                 pair_addr = "0x" + words[0][-40:]
                             elif topic0 == _POOL_CREATED_TOPIC and len(words) >= 2:
@@ -3139,17 +3162,45 @@ async def evm_ws_listener(chain_id: str):
                                     "dex": dex_name,
                                 }
 
+                        created_ts = time.time()
+                        creation_dt = {
+                            "mint": new_token,
+                            "symbol": "NEW",
+                            "name": "NEW",
+                            "created_at": created_ts,
+                            "ws_discovered": True,
+                            "ws_initial_buy_sol": 0.0,
+                            "mc_sol_at_creation": 0.0,
+                            "chain_id": chain_id,
+                        }
+
+                        # [v4.36] Pre-track immediately, same pattern as pump.fun and
+                        # four.meme — otherwise this token doesn't exist in `tokens`
+                        # (and _handle_evm_swap_log requires it to) until DexScreener
+                        # enrichment succeeds, which can take up to ~55s (3 retries)
+                        # or fail entirely on chains DexScreener indexes slowly/never.
+                        # That silently threw away this pair's whole early trading
+                        # window — often the most active one — and dropped the
+                        # token forever if DexScreener never picked it up at all.
+                        # No liquidity/MC estimate is possible from PairCreated alone
+                        # (no reserves in the event, unlike a bonding-curve create);
+                        # see the FRESH🌱 path in run_detections and the matching
+                        # fallback in effective_liq_vol_buyratio for how this stub
+                        # gets evaluated with liq/mc still at 0 until DexScreener
+                        # enriches it in place (existing _finalize_ws_token logic,
+                        # unchanged) or ws_enrich_worker's normal path replaces it.
+                        if pair_addr:
+                            async with tokens_lock:
+                                if new_token not in tokens and enforce_token_cap("NEW"):
+                                    tokens[new_token] = TokenInfo(
+                                        mint=new_token, symbol="NEW", name="NEW",
+                                        created_at=created_ts, chain_id=chain_id,
+                                        ws_discovered=True, ws_pre_enrichment=True,
+                                    )
+                                    evm_ws_stats[chain_id]["pre_tracked"] += 1
+
                         if ws_discovery_queue is not None:
-                            await ws_discovery_queue.put({
-                                "mint": new_token,
-                                "symbol": "NEW",
-                                "name": "NEW",
-                                "created_at": time.time(),
-                                "ws_discovered": True,
-                                "ws_initial_buy_sol": 0.0,
-                                "mc_sol_at_creation": 0.0,
-                                "chain_id": chain_id,
-                            })
+                            await ws_discovery_queue.put(creation_dt)
 
                     except json.JSONDecodeError:
                         pass
@@ -3458,6 +3509,7 @@ def format_gem_alert(token: TokenInfo, alert_reason: str = "GEM", distro: "Distr
         "VOL💰": "💰 Vol Spike", "VACCEL📊": "📊 Vol Accel", "KOL🐦": "🐦 KOL", "GEM": "💎 Gem",
         "RUNNER🚀": "🚀 Runner (already running)",
         "CURVE🌊": "🌊 four.meme Curve",
+        "FRESH🌱": "🌱 Fresh (pre-index buy pressure)",
     }
     signal_label = SIGNAL_LABELS.get(alert_reason, f"💎 {alert_reason}")
     # [v4.27] Same WS-derived fallback run_detections used to decide to alert —
@@ -3474,10 +3526,17 @@ def format_gem_alert(token: TokenInfo, alert_reason: str = "GEM", distro: "Distr
     # of a misleading "MC $0".
     if alert_reason == "CURVE🌊":
         mc_s = f"{fmt_usd_short(token.fourmeme_raised_usd)} raised (of ~{FOURMEME_GRADUATION_BNB:.0f} BNB curve)"
+    elif alert_reason == "FRESH🌱":
+        # [v4.36] No DexScreener data yet for this stub — a literal "$0" here
+        # would read as a dead/worthless token when the opposite is true.
+        mc_s = "pending (not yet indexed)"
     else:
         mc_s = fmt_usd_short(token.market_cap)
     vol_s = fmt_usd_short(disp_vol)
-    liq_s = fmt_usd_short(disp_liq)
+    # [v4.36] Same reasoning as mc_s above — no liquidity proxy exists for a
+    # vanilla EVM pair pre-DexScreener, so "$0" here would misleadingly read
+    # as no liquidity at all rather than "not known yet."
+    liq_s = "n/a (pre-index)" if alert_reason == "FRESH🌱" else fmt_usd_short(disp_liq)
     txn_str = f"{token.buys_h1}B / {token.sells_h1}S" if (token.buys_h1 or token.sells_h1) else "—"
 
     # Signal badges (compact)
@@ -4010,6 +4069,32 @@ async def run_detections(token: TokenInfo, session: aiohttp.ClientSession = None
                 and not_suppressed
             )
 
+        # ── [v4.36] FRESH🌱 path: vanilla EVM pair, real buy pressure, no
+        # DexScreener data yet ────────────────────────────────────────────
+        # See the pre-track stub added in evm_ws_listener: PancakeV2/V3,
+        # Uniswap, Sushi, and Aerodrome pairs are now tracked from the instant
+        # they're created, same as pump.fun/four.meme, instead of only once
+        # DexScreener returns data (which could take ~55s or fail entirely).
+        # No liquidity/MC exists for these stubs (no reserves in a
+        # PairCreated event, unlike a bonding curve's raised amount) so this
+        # is gated on real dollar volume + trade count + buy dominance from
+        # the raw swap counters instead — same shape as fourmeme_curve_running
+        # above, deliberately kept off every mc_min/mc_max-gated path since
+        # there's no verified price to gate on. Stops firing the moment
+        # DexScreener enriches (liquidity becomes > 0) and the normal paths
+        # take over from there.
+        evm_fresh_momentum = False
+        if (token.chain_id in ("ethereum", "bsc", "base")
+                and token.ws_pre_enrichment and token.liquidity == 0):
+            ws_total_fresh = token.ws_buy_count + token.ws_sell_count
+            ws_usd_fresh = token.ws_buy_vol_usd + token.ws_sell_vol_usd
+            evm_fresh_momentum = (
+                ws_total_fresh >= EVM_FRESH_MIN_TRADES
+                and ws_usd_fresh >= EVM_FRESH_MIN_USD_VOL
+                and token.ws_buy_count / max(token.ws_sell_count, 1) >= GEM_WS_BUY_PRESSURE
+                and not_suppressed
+            )
+
         alert_reason = None
         if standard:
             alert_reason = "GEM"
@@ -4026,6 +4111,9 @@ async def run_detections(token: TokenInfo, session: aiohttp.ClientSession = None
         elif fourmeme_curve_running:
             alert_reason = "CURVE🌊"
             fourmeme_stats["curve_alerts"] += 1
+        elif evm_fresh_momentum:
+            alert_reason = "FRESH🌱"
+            evm_ws_stats[token.chain_id]["fresh_alerts"] += 1
 
         if alert_reason:
             # [v4.10] Distribution + bundle check (Solana only, non-blocking)
