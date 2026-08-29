@@ -674,6 +674,11 @@ GEM_VOL_ACCEL_MC_MAX = 50_000  # [v4.28] vol-accel ceiling aligned to the 10k-50
 # already covers "established token regaining volume" as its own category).
 GEM_MOMENTUM_MC_MAX = float(os.getenv("GEM_MOMENTUM_MC_MAX", "2000000"))  # $2M sanity ceiling
 
+# [v4.41] Kill switch for the RUNNER🚀 path (momentum_running below), off by
+# default per user request. Left as an env toggle rather than deleting the
+# path outright so it can be turned back on later without a code change.
+RUNNER_ENABLED = _env_bool("RUNNER_ENABLED", False)
+
 # [v4.36] FRESH🌱 path — real on-chain buy pressure on a vanilla EVM DEX pair
 # (PancakeV2/V3, Uniswap, Sushi, Aerodrome) that DexScreener hasn't indexed
 # yet. See the pre-track stub in evm_ws_listener and the matching gate in
@@ -4224,7 +4229,8 @@ async def run_detections(token: TokenInfo, session: aiohttp.ClientSession = None
         # a healthy ratio) since there's no age/MC cheapness gate doing any
         # of that filtering for us at this size.
         momentum_running = (
-            mc > mc_max
+            RUNNER_ENABLED
+            and mc > mc_max
             and mc <= GEM_MOMENTUM_MC_MAX
             and age_s <= age_max
             and vol_ok_momentum
