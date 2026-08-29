@@ -788,6 +788,19 @@ boosted_mints: Set[str] = set()
 # [v4.11] Per-chain last poll timestamps for staggered chain polling
 _last_chain_poll: dict = {"ethereum": 0.0, "bsc": 0.0, "base": 0.0, "robinhood": 0.0}
 
+# [v4.40] Solana pending-entry state — see _handle_ws_create/_finalize_sol_pending_entry.
+# mint -> {"symbol", "name", "created_at", "mc_sol", "vsol_curve", "initial_buy",
+#          "ws_buy_count", "ws_sell_count", "ws_buy_vol_usd", "ws_sell_vol_usd"}
+# A brand-new pump.fun mint lands here (NOT in `tokens`) the instant it's created;
+# it's promoted to `tokens` (or dropped for good) exactly once, when its one-shot
+# delayed check fires. Never re-checked after that either way.
+_pending_sol_entries: Dict[str, dict] = {}
+SOL_ENTRY_CHECK_DELAY = float(os.getenv("SOL_ENTRY_CHECK_DELAY", "45"))
+# Trade-feed subscription slots reserved for pending mints, out of the shared
+# WS_MAX_TRADE_SUBS=50 PumpPortal cap (the rest stays available for already-
+# alerted tokens, which use the same subscription pool via ws_sub_request_queue).
+SOL_PENDING_SUB_CAP = int(os.getenv("SOL_PENDING_SUB_CAP", "15"))
+
 # [v4.6] WS spam dedup: symbol -> list of (timestamp, mint) tuples seen within cooldown window
 # Used to detect squatter swarms (many different mints sharing the same ticker in a short burst).
 ws_symbol_cooldown: Dict[str, list] = {}
@@ -2298,44 +2311,35 @@ async def _handle_ws_create(data: dict):
     ws_stats["tokens_discovered"] += 1
     logger.info(f"⚡ WS NEW: ${symbol} | MC: {mc_sol:.1f} SOL | Init buy: {initial_buy:.2f} SOL")
 
-    # [v4.12, gated as of v4.39] Immediately add a stub token so trade events
-    # can accumulate before DexScreener enrichment completes — but only when
-    # this token's OWN first-observed data (mc_sol at the moment of creation,
-    # a real on-chain-derived number, not a guess) already lands inside the
-    # entry window. By explicit request this bot no longer tracks anything
-    # whose first observation falls outside the window, and doesn't keep
-    # re-checking a skipped token later — a launch that starts under mc_min
-    # and climbs into range afterward is not picked up (no background
-    # watching of untracked mints). Consequence worth knowing: most pump.fun
-    # tokens launch well under $10k (commonly ~$5-8k at the ~28-40 SOL
-    # starting range seen in production logs), so this floor alone will skip
-    # the large majority of Solana launches at creation — that's the
-    # tradeoff of "first observation only," not a bug.
+    # [v4.12 -> v4.40] No more instant tracking at creation. Judging a brand-
+    # new mint's MC at t=0 (its very first data point) means judging it before
+    # it's had any chance to trade -- most pump.fun tokens start well under
+    # $10k (commonly ~$5-8k at the ~28-40 SOL starting range seen in
+    # production logs) and climb from there. Instead: park this mint in
+    # _pending_sol_entries (NOT `tokens`), request a live trade-feed
+    # subscription for it so its mc_sol keeps updating in the background for
+    # a short bounded window, and check ONCE, after that window, whether it
+    # made it into the entry range. Still "look once, no indefinite
+    # watching" -- just timed to give a real launch a fair chance instead of
+    # judging it before its first trade.
     created_ts = time.time()
-    estimated_mc = mc_sol * WS_SOL_PRICE_USD
-    # [v4.27] vSolInBondingCurve is the SOL actually locked in the curve — the
-    # closest thing a pre-graduation token has to "liquidity". DexScreener has
-    # no pair for it at all until migration, so without this run_detections'
-    # liq_ok gate would stay permanently unsatisfiable. See run_detections.
-    estimated_liq = vsol_curve * WS_SOL_PRICE_USD
-    _sol_th = get_thresholds("solana")
-    if _sol_th["mc_min"] <= estimated_mc <= _sol_th["mc_max"]:
-        async with tokens_lock:
-            if mint not in tokens:
-                if enforce_token_cap(symbol):
-                    tokens[mint] = TokenInfo(
-                        mint=mint,
-                        symbol=symbol,
-                        name=name,
-                        created_at=created_ts,
-                        market_cap=estimated_mc,
-                        ws_discovered=True,
-                        ws_initial_buy_sol=initial_buy,
-                        ws_pre_enrichment=True,
-                        chain_id="solana",
-                        ws_liquidity_estimate=estimated_liq,
-                    )
-                    logger.debug(f"🔬 Pre-tracked ${symbol} (stub MC≈${estimated_mc:,.0f})")
+    _pending_sol_entries[mint] = {
+        "symbol": symbol,
+        "name": name,
+        "created_at": created_ts,
+        "mc_sol": mc_sol,
+        "vsol_curve": vsol_curve,
+        "initial_buy": initial_buy,
+        "ws_buy_count": 0, "ws_sell_count": 0,
+        "ws_buy_vol_usd": 0.0, "ws_sell_vol_usd": 0.0,
+    }
+    if len(_pending_sol_entries) <= SOL_PENDING_SUB_CAP and ws_sub_request_queue is not None:
+        try:
+            ws_sub_request_queue.put_nowait([mint])
+        except asyncio.QueueFull:
+            pass  # no live updates for this one during its window -- it'll just be
+                   # judged on its creation-time snapshot when the delayed check fires
+    asyncio.create_task(_finalize_sol_pending_entry(mint))
 
     # Queue for DexScreener enrichment (don't fetch in WS handler — keep it fast)
     if ws_discovery_queue is not None:
@@ -2350,6 +2354,55 @@ async def _handle_ws_create(data: dict):
         })
 
 
+async def _finalize_sol_pending_entry(mint: str) -> None:
+    """
+    [v4.40] The one-shot, delayed entry check for a Solana pending mint.
+    Fires once, SOL_ENTRY_CHECK_DELAY seconds after creation. If this mint's
+    latest mc_sol (updated live by _handle_ws_trade while pending, if its
+    trade-feed subscription went through) now lands inside the entry window,
+    promote it to a real tracked TokenInfo -- carrying over any buy/sell
+    activity that accumulated during the wait so that data isn't lost. If
+    not, drop it for good; nothing revisits this mint again.
+    """
+    await asyncio.sleep(SOL_ENTRY_CHECK_DELAY)
+    entry = _pending_sol_entries.pop(mint, None)
+    if not entry:
+        return  # already resolved another way (e.g. DexScreener path got there first)
+
+    estimated_mc = entry["mc_sol"] * WS_SOL_PRICE_USD
+    # [v4.27] vSolInBondingCurve is the SOL actually locked in the curve — the
+    # closest thing a pre-graduation token has to "liquidity". DexScreener has
+    # no pair for it at all until migration, so without this run_detections'
+    # liq_ok gate would stay permanently unsatisfiable. See run_detections.
+    estimated_liq = entry["vsol_curve"] * WS_SOL_PRICE_USD
+    th = get_thresholds("solana")
+    if not (th["mc_min"] <= estimated_mc <= th["mc_max"]):
+        return
+
+    async with tokens_lock:
+        if mint not in tokens and enforce_token_cap(entry["symbol"]):
+            tokens[mint] = TokenInfo(
+                mint=mint,
+                symbol=entry["symbol"],
+                name=entry["name"],
+                created_at=entry["created_at"],
+                market_cap=estimated_mc,
+                ws_discovered=True,
+                ws_initial_buy_sol=entry["initial_buy"],
+                ws_pre_enrichment=True,
+                chain_id="solana",
+                ws_liquidity_estimate=estimated_liq,
+                ws_buy_count=entry["ws_buy_count"],
+                ws_sell_count=entry["ws_sell_count"],
+                ws_buy_vol_usd=entry["ws_buy_vol_usd"],
+                ws_sell_vol_usd=entry["ws_sell_vol_usd"],
+            )
+            logger.debug(
+                f"🔬 Pre-tracked ${entry['symbol']} after {SOL_ENTRY_CHECK_DELAY:.0f}s "
+                f"grace check (MC≈${estimated_mc:,.0f})"
+            )
+
+
 async def _handle_ws_trade(data: dict):
     """
     Handle a live trade event from PumpPortal WS.
@@ -2357,18 +2410,35 @@ async def _handle_ws_trade(data: dict):
                  marketCapSol, vSolInBondingCurve (updated bonding-curve state after this trade)
     """
     mint = data.get("mint")
-    if not mint or mint not in tokens:
+    if not mint:
         return
 
     tx_type = data.get("txType", "")
     sol_amount = float(data.get("solAmount", 0) or 0)
     mc_sol = float(data.get("marketCapSol", 0) or 0)
     vsol_curve = float(data.get("vSolInBondingCurve", 0) or 0)
+    usd_amount = sol_amount * WS_SOL_PRICE_USD
+
+    # [v4.40] Still-pending mint (not yet promoted to `tokens`, or already
+    # dropped) — update its pending snapshot so the one-shot delayed check in
+    # _finalize_sol_pending_entry sees real, live-updated data instead of the
+    # frozen creation-time estimate. Deliberately does NOT touch `tokens`.
+    pending = _pending_sol_entries.get(mint)
+    if pending is not None:
+        pending["mc_sol"] = mc_sol
+        pending["vsol_curve"] = vsol_curve
+        if tx_type == "buy":
+            pending["ws_buy_count"] += 1
+            pending["ws_buy_vol_usd"] += usd_amount
+        elif tx_type == "sell":
+            pending["ws_sell_count"] += 1
+            pending["ws_sell_vol_usd"] += usd_amount
+
+    if mint not in tokens:
+        return
 
     ws_stats["trades_received"] += 1
     ws_stats["last_message_at"] = time.time()
-
-    usd_amount = sol_amount * WS_SOL_PRICE_USD
 
     async with tokens_lock:
         t = tokens.get(mint)
