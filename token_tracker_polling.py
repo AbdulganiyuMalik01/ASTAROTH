@@ -485,13 +485,19 @@ CHAINS: Dict[str, dict] = {
 # so retuning a chain no longer requires a code change + redeploy — the
 # literal below each one is just the default when no env var is set.
 def _chain_thresholds(prefix: str, age_min, age_max, mc_min, mc_max,
-                       vol_mc_ratio, liq_min, buy_ratio_min, min_buys_h1) -> dict:
+                       vol_min, vol_max, liq_min, buy_ratio_min, min_buys_h1) -> dict:
     return {
         "age_min":       _env_num(f"{prefix}_AGE_MIN", age_min, int),
         "age_max":       _env_num(f"{prefix}_AGE_MAX", age_max, int),
         "mc_min":        _env_num(f"{prefix}_MC_MIN", mc_min, float),
         "mc_max":        _env_num(f"{prefix}_MC_MAX", mc_max, float),
-        "vol_mc_ratio":  _env_num(f"{prefix}_VOL_MC_RATIO", vol_mc_ratio, float),
+        # [v4.39] Replaces the old vol_mc_ratio (a floor-only vol/mc PERCENTAGE
+        # gate) with an absolute-dollar volume BAND — a token must show
+        # between vol_min and vol_max of real dollar volume, independent of
+        # its exact mc within the mc_min..mc_max window. See CHAIN_THRESHOLDS
+        # below for the concrete per-chain numbers.
+        "vol_min":       _env_num(f"{prefix}_VOL_MIN", vol_min, float),
+        "vol_max":       _env_num(f"{prefix}_VOL_MAX", vol_max, float),
         "liq_min":       _env_num(f"{prefix}_LIQ_MIN", liq_min, float),
         "buy_ratio_min": _env_num(f"{prefix}_BUY_RATIO_MIN", buy_ratio_min, float),
         "min_buys_h1":   _env_num(f"{prefix}_MIN_BUYS_H1", min_buys_h1, int),
@@ -534,16 +540,28 @@ def _chain_thresholds(prefix: str, age_min, age_max, mc_min, mc_max,
 #     bar still filters genuinely dead tokens while not excluding early
 #     movers whose volume hasn't caught up to their MC yet.
 # All still per-chain env-overridable if any of these need dialing back.
+#
+# [v4.39] Explicit request: replace the mc_max=$50k-for-everyone / vol_mc_ratio
+# percentage-floor design with (a) per-chain-family MC windows and (b) an
+# absolute-dollar volume band, and stop tracking a token at all unless its
+# FIRST observed data already lands inside both — no pre-track stub, no
+# re-checking a token later if it was outside the window the first time it
+# was seen (see the entry-gate comments at each tokens[mint] = TokenInfo(...)
+# creation site). Concretely:
+#   - solana:   MC $10k-$30k,  volume $10k-$30k
+#   - bsc/base/ethereum/robinhood (all EVM chains): MC $5k-$50k, volume $10k-$50k
+# Both are per-chain env-overridable (SOL_MC_MIN/SOL_VOL_MAX/BSC_MC_MIN/etc.)
+# same as every other threshold here.
 CHAIN_THRESHOLDS = {
-    "solana":    _chain_thresholds("SOL",  3 * 60,  6 * 3600, 10_000,        50_000, 0.12, 5_000, 0.50, 8),
-    "bsc":       _chain_thresholds("BSC",  2 * 60, 12 * 3600, 10_000,        50_000, 0.06, 5_000, 0.45, 5),
-    "base":      _chain_thresholds("BASE", 3 * 60,  6 * 3600, 10_000,        50_000, 0.08, 5_000, 0.45, 5),
-    "ethereum":  _chain_thresholds("ETH",  2 * 60, 24 * 3600, 10_000,        50_000, 0.04, 5_000, 0.45, 2),
+    "solana":    _chain_thresholds("SOL",  3 * 60,  6 * 3600, 10_000, 30_000, 10_000, 30_000, 5_000, 0.50, 8),
+    "bsc":       _chain_thresholds("BSC",  2 * 60, 12 * 3600,  5_000, 50_000, 10_000, 50_000, 5_000, 0.45, 5),
+    "base":      _chain_thresholds("BASE", 3 * 60,  6 * 3600,  5_000, 50_000, 10_000, 50_000, 5_000, 0.45, 5),
+    "ethereum":  _chain_thresholds("ETH",  2 * 60, 24 * 3600,  5_000, 50_000, 10_000, 50_000, 5_000, 0.45, 2),
     # [v4.37] Robinhood Chain — brand new, no live tuning history yet. Starts
     # as a copy of BSC's thresholds (same "fast, high meme volume" profile
     # DexScreener's own numbers for this chain suggest) — fully
     # env-overridable (RH_MC_MIN, RH_AGE_MAX, etc.) once real data comes in.
-    "robinhood": _chain_thresholds("RH",   2 * 60, 12 * 3600, 10_000,        50_000, 0.06, 5_000, 0.45, 5),
+    "robinhood": _chain_thresholds("RH",   2 * 60, 12 * 3600,  5_000, 50_000, 10_000, 50_000, 5_000, 0.45, 5),
 }
 
 def get_thresholds(chain_id: str) -> dict:
@@ -2280,8 +2298,19 @@ async def _handle_ws_create(data: dict):
     ws_stats["tokens_discovered"] += 1
     logger.info(f"⚡ WS NEW: ${symbol} | MC: {mc_sol:.1f} SOL | Init buy: {initial_buy:.2f} SOL")
 
-    # [v4.12] Pre-track: immediately add a stub token so trade events can accumulate
-    # before DexScreener enrichment completes. Stub MC is estimated from WS data.
+    # [v4.12, gated as of v4.39] Immediately add a stub token so trade events
+    # can accumulate before DexScreener enrichment completes — but only when
+    # this token's OWN first-observed data (mc_sol at the moment of creation,
+    # a real on-chain-derived number, not a guess) already lands inside the
+    # entry window. By explicit request this bot no longer tracks anything
+    # whose first observation falls outside the window, and doesn't keep
+    # re-checking a skipped token later — a launch that starts under mc_min
+    # and climbs into range afterward is not picked up (no background
+    # watching of untracked mints). Consequence worth knowing: most pump.fun
+    # tokens launch well under $10k (commonly ~$5-8k at the ~28-40 SOL
+    # starting range seen in production logs), so this floor alone will skip
+    # the large majority of Solana launches at creation — that's the
+    # tradeoff of "first observation only," not a bug.
     created_ts = time.time()
     estimated_mc = mc_sol * WS_SOL_PRICE_USD
     # [v4.27] vSolInBondingCurve is the SOL actually locked in the curve — the
@@ -2289,22 +2318,24 @@ async def _handle_ws_create(data: dict):
     # no pair for it at all until migration, so without this run_detections'
     # liq_ok gate would stay permanently unsatisfiable. See run_detections.
     estimated_liq = vsol_curve * WS_SOL_PRICE_USD
-    async with tokens_lock:
-        if mint not in tokens:
-            if enforce_token_cap(symbol):
-                tokens[mint] = TokenInfo(
-                    mint=mint,
-                    symbol=symbol,
-                    name=name,
-                    created_at=created_ts,
-                    market_cap=estimated_mc,
-                    ws_discovered=True,
-                    ws_initial_buy_sol=initial_buy,
-                    ws_pre_enrichment=True,
-                    chain_id="solana",
-                    ws_liquidity_estimate=estimated_liq,
-                )
-                logger.debug(f"🔬 Pre-tracked ${symbol} (stub MC≈${estimated_mc:,.0f})")
+    _sol_th = get_thresholds("solana")
+    if _sol_th["mc_min"] <= estimated_mc <= _sol_th["mc_max"]:
+        async with tokens_lock:
+            if mint not in tokens:
+                if enforce_token_cap(symbol):
+                    tokens[mint] = TokenInfo(
+                        mint=mint,
+                        symbol=symbol,
+                        name=name,
+                        created_at=created_ts,
+                        market_cap=estimated_mc,
+                        ws_discovered=True,
+                        ws_initial_buy_sol=initial_buy,
+                        ws_pre_enrichment=True,
+                        chain_id="solana",
+                        ws_liquidity_estimate=estimated_liq,
+                    )
+                    logger.debug(f"🔬 Pre-tracked ${symbol} (stub MC≈${estimated_mc:,.0f})")
 
     # Queue for DexScreener enrichment (don't fetch in WS handler — keep it fast)
     if ws_discovery_queue is not None:
@@ -3235,31 +3266,22 @@ async def evm_ws_listener(chain_id: str):
                             "chain_id": chain_id,
                         }
 
-                        # [v4.36] Pre-track immediately, same pattern as pump.fun and
-                        # four.meme — otherwise this token doesn't exist in `tokens`
-                        # (and _handle_evm_swap_log requires it to) until DexScreener
-                        # enrichment succeeds, which can take up to ~55s (3 retries)
-                        # or fail entirely on chains DexScreener indexes slowly/never.
-                        # That silently threw away this pair's whole early trading
-                        # window — often the most active one — and dropped the
-                        # token forever if DexScreener never picked it up at all.
-                        # No liquidity/MC estimate is possible from PairCreated alone
-                        # (no reserves in the event, unlike a bonding-curve create);
-                        # see the FRESH🌱 path in run_detections and the matching
-                        # fallback in effective_liq_vol_buyratio for how this stub
-                        # gets evaluated with liq/mc still at 0 until DexScreener
-                        # enriches it in place (existing _finalize_ws_token logic,
-                        # unchanged) or ws_enrich_worker's normal path replaces it.
-                        if pair_addr:
-                            async with tokens_lock:
-                                if new_token not in tokens and enforce_token_cap("NEW"):
-                                    tokens[new_token] = TokenInfo(
-                                        mint=new_token, symbol="NEW", name="NEW",
-                                        created_at=created_ts, chain_id=chain_id,
-                                        ws_discovered=True, ws_pre_enrichment=True,
-                                    )
-                                    evm_ws_stats[chain_id]["pre_tracked"] += 1
-
+                        # [v4.36->v4.39] The immediate pre-track stub that used to be
+                        # created here (before any real MC data existed) is REMOVED —
+                        # by explicit request, this bot no longer tracks a token at
+                        # the instant it's created. A PairCreated/PoolCreated event
+                        # carries no reserves, so there was never a real MC estimate
+                        # possible here anyway (only the FRESH🌱 path, now dormant,
+                        # existed to alert off raw trade counters with mc still at 0).
+                        # Pair metadata (evm_pair_meta, above) still gets recorded
+                        # regardless — that's needed for _handle_evm_swap_log to
+                        # attribute swaps correctly IF this pair later becomes a
+                        # tracked token via the queue below (once DexScreener returns
+                        # real MC data) or via fetch_chain_new_pairs' own poll. The
+                        # entry gate (mc within CHAIN_THRESHOLDS mc_min..mc_max) is
+                        # enforced once, at that first-real-data moment, in
+                        # _finalize_ws_token and the polling-loop creation path —
+                        # see v4.39 comments there. No re-checking after that.
                         if ws_discovery_queue is not None:
                             await ws_discovery_queue.put(creation_dt)
 
@@ -3966,7 +3988,8 @@ async def run_detections(token: TokenInfo, session: aiohttp.ClientSession = None
         age_max      = th["age_max"]
         mc_min       = th["mc_min"]
         mc_max       = th["mc_max"]
-        vol_mc_ratio = th["vol_mc_ratio"]
+        vol_min      = th["vol_min"]
+        vol_max      = th["vol_max"]
         liq_min      = th["liq_min"]
         buy_ratio_min = th["buy_ratio_min"]
         min_buys_h1  = th["min_buys_h1"]
@@ -3974,7 +3997,20 @@ async def run_detections(token: TokenInfo, session: aiohttp.ClientSession = None
         # ── Base gates ──────────────────────────────────────────────────────
         age_ok   = age_min <= age_s <= age_max
         mc_ok    = mc_min <= mc <= mc_max
-        vol_ok   = mc > 0 and (vol / mc) >= vol_mc_ratio
+        # [v4.39] Was a floor-only vol/mc PERCENTAGE ratio; now an absolute-
+        # dollar volume BAND, independent of mc — see CHAIN_THRESHOLDS. Only
+        # for the "entry window" paths (standard/fast_velocity), which already
+        # share this chain's mc_min..mc_max ceiling — see vol_ok_momentum
+        # below for why momentum_running (which explicitly operates ABOVE
+        # mc_max) does NOT reuse this same band.
+        vol_ok   = vol_min <= vol <= vol_max
+        # momentum_running catches tokens already past mc_max on real,
+        # CURRENT acceleration (its own velocity/accel checks below already
+        # gate that) — real volume at that size routinely blows past this
+        # chain's entry-tier vol_max (e.g. a $500k-mc runner easily clears
+        # $50k+ volume), so capping it at the same ceiling as a $10-50k-mc
+        # entry would silently make that path nearly unreachable. Floor only.
+        vol_ok_momentum = vol >= vol_min
         liq_ok   = liq >= liq_min
 
         # ── Buy pressure gates ────────────────────────────────────────────
@@ -4121,7 +4157,7 @@ async def run_detections(token: TokenInfo, session: aiohttp.ClientSession = None
             mc > mc_max
             and mc <= GEM_MOMENTUM_MC_MAX
             and age_s <= age_max
-            and vol_ok
+            and vol_ok_momentum
             and liq_ok
             and buy_ratio_ok
             and min_buys_ok
@@ -4283,7 +4319,7 @@ async def run_detections(token: TokenInfo, session: aiohttp.ClientSession = None
             elif not mc_ok:
                 skip = f"MC ${mc:,.0f} (need ${mc_min:,.0f}-${mc_max:,.0f})"
             elif not vol_ok:
-                skip = f"vol/MC {vol/max(mc,1):.2%} (need {vol_mc_ratio:.0%})"
+                skip = f"vol ${vol:,.0f} (need ${vol_min:,.0f}-${vol_max:,.0f})"
             elif not liq_ok:
                 skip = f"liq ${liq:,.0f} (need ${liq_min:,.0f})"
             elif not buy_ratio_ok:
@@ -4469,6 +4505,15 @@ async def _finalize_ws_token(mint: str, token_data: dict, chain_id: str, dex_dat
         elif mint not in tokens:
             if not dex_data:
                 return  # never had a stub and DexScreener never resolved it — nothing to track
+            # [v4.39] Entry gate — this is this token's first real data point
+            # (no pre-track stub existed for it, e.g. a KOL-resolved mint or
+            # any EVM pair now that pre-track is off). Only start tracking it
+            # if that first real MC already sits inside this chain's entry
+            # window; otherwise, per the same "first observation only, no
+            # re-checking later" rule as above, this mint is never revisited.
+            _th = get_thresholds(final_chain)
+            if not (_th["mc_min"] <= mc <= _th["mc_max"]):
+                return
             if not enforce_token_cap(sym):
                 return
 
@@ -4682,11 +4727,18 @@ async def polling_loop():
                             SKIP_SYMBOLS = {"SOL", "USDC", "USDT", "BTC", "ETH", "BONK", "WIF", "JUP", "RAY", "BSC", "BASE", "BNB", "WBNB", "WETH", "WBTC", "DAI", "BUSD", "CAKE", "ETHEREUM", "UNISWAP", "UNI", "LINK", "AAVE", "MKR", "COMP", "SNX"}
                             chain_id_tok = token_data.get("chain_id", "solana")
                             _th = get_thresholds(chain_id_tok)
-                            mc_floor = max(5_000, _th["mc_min"] // 4)  # dynamic per-chain floor (quarter of detection min)
                             if sym in SKIP_SYMBOLS or mc > 5_000_000:
                                 seen_mints.add(mint)
                                 continue
-                            if mc < mc_floor:
+                            # [v4.39] Was a quarter of mc_min — deliberately let a
+                            # token in below the real floor so later polls (this
+                            # loop re-fetches dex_data for already-tracked tokens
+                            # elsewhere) could catch it climbing into range. That's
+                            # exactly the "background watching" this bot no longer
+                            # does: entry is now a hard mc_min..mc_max check against
+                            # THIS first observation only — outside that window,
+                            # the mint is skipped and never revisited.
+                            if not (_th["mc_min"] <= mc <= _th["mc_max"]):
                                 continue
 
                             async with tokens_lock:
@@ -4988,7 +5040,7 @@ async def analysis(limit: int = 100, alerted_only: bool = False, chain: str = ""
             # Normalise to gate name only (strip numbers)
             if key.startswith("age"): key = "age"
             elif key.startswith("MC"): key = "mc"
-            elif key.startswith("vol/MC"): key = "vol_mc_ratio"
+            elif key.startswith("vol "): key = "vol"
             elif key.startswith("liq"): key = "liq"
             elif key.startswith("buy_ratio"): key = "buy_ratio"
             elif key.startswith("buys_h1"): key = "buys_h1"
