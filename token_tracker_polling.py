@@ -4084,11 +4084,21 @@ async def run_detections(token: TokenInfo, session: aiohttp.ClientSession = None
             and age_s <= age_max
         )
 
+        # [v4.38 fix] mc_ok was missing here -- eth_vol_signal (this path's
+        # sibling, right above) has always gated on it, but this one never
+        # did. Confirmed live in production logs: a VACCEL📊 alert fired for
+        # $NEW with MC=$6,164,227,125 (a clearly corrupted/misparsed market
+        # cap -- Vol was only $21,170, i.e. a vol/mc ratio of ~0.0000034,
+        # nowhere near any real gate) because nothing here checked mc at
+        # all. Adding the same mc_ok bound eth_vol_signal already uses closes
+        # that hole -- any mc outside the chain's normal mc_min..mc_max window
+        # (garbage-low OR garbage-high) can no longer reach this path.
         eth_vol_accel = (
             token.chain_id in ("ethereum", "bsc", "base", "robinhood")
             and is_buy_vol_accelerating(token)
             and is_buy_vol_significant(token)
             and liq_ok
+            and mc_ok
             and price_not_crashing
             and mc_not_collapsed
             and not_suppressed
