@@ -971,6 +971,14 @@ class TokenInfo:
     chain_id: str = "solana"          # which chain this token is on
     # [v4.11] ETH buy volume tracking
     buy_volume_h1: float = 0.0        # USD value of buy-side volume in last 1h
+    # [v4.42] Real total (buy+sell) 1h volume straight off DexScreener's own
+    # volume.h1 field. Distinct from volume_usd, which is actually an
+    # estimated buy-only slice of h1 volume (h1_vol * buy_ratio, see
+    # get_dex_data) -- this is what vol_ok/vol_ok_momentum in run_detections
+    # now check the entry-gate vol_min/vol_max window against, per user
+    # request that the volume threshold be measured on real 1h volume rather
+    # than a derived estimate.
+    volume_h1_total: float = 0.0
     volume_m5: float = 0.0            # 5-min volume (whale spike detection)
     vol_usd_history: List[float] = field(default_factory=list)  # buy vol history for accel
     # [v4.11] Anti-dump / sustained signal fields
@@ -1040,6 +1048,7 @@ def _token_to_dict(token: TokenInfo) -> dict:
         "_sent_milestones": list(getattr(token, '_sent_milestones', set())),
         "chain_id": token.chain_id,
         "buy_volume_h1": token.buy_volume_h1,
+        "volume_h1_total": token.volume_h1_total,
         "volume_m5": token.volume_m5,
         "price_change_h1": token.price_change_h1,
         "consecutive_green_polls": token.consecutive_green_polls,
@@ -1081,6 +1090,7 @@ def _token_from_dict(d: dict) -> TokenInfo:
         ws_liquidity_estimate=d.get("ws_liquidity_estimate", 0.0),
         chain_id=d.get("chain_id", "solana"),
         buy_volume_h1=d.get("buy_volume_h1", 0.0),
+        volume_h1_total=d.get("volume_h1_total", 0.0),
         volume_m5=d.get("volume_m5", 0.0),
         price_change_h1=d.get("price_change_h1", 0.0),
         consecutive_green_polls=d.get("consecutive_green_polls", 0),
@@ -1214,7 +1224,13 @@ def effective_liq_vol_buyratio(token: TokenInfo) -> tuple:
         vol = token.ws_buy_vol_usd + token.ws_sell_vol_usd
         buy_ratio = token.ws_buy_count / max(ws_total, 1) if ws_total >= 5 else token.buy_ratio
         return token.liquidity, vol, buy_ratio
-    return token.liquidity, token.volume_usd, token.buy_ratio
+    # [v4.42] Real DexScreener data available -- use actual total 1h volume
+    # (buy+sell) instead of token.volume_usd, which is really an estimated
+    # buy-only slice of h1 volume (see get_dex_data / TokenInfo.volume_usd
+    # vs volume_h1_total). The vol_ok/vol_ok_momentum entry-gate bands in
+    # run_detections, and the "Vol:" figure shown on the alert card, both
+    # come from this return value -- both now reflect real 1h volume.
+    return token.liquidity, token.volume_h1_total, token.buy_ratio
 
 
 def update_vol_history(token: TokenInfo, new_vol: float):
@@ -4564,6 +4580,7 @@ async def _finalize_ws_token(mint: str, token_data: dict, chain_id: str, dex_dat
             t.market_cap = mc if mc else t.market_cap
             t.last_mc = t.market_cap
             t.volume_usd = dex_data["volume_usd"] if dex_data else t.volume_usd
+            t.volume_h1_total = dex_data.get("volume_h1_total", 0.0) if dex_data else t.volume_h1_total
             t.liquidity = dex_data["liquidity"] if dex_data else t.liquidity
             t.buy_ratio = dex_data.get("buy_ratio", t.buy_ratio) if dex_data else t.buy_ratio
             t.buys_h1 = dex_data.get("buys_h1", t.buys_h1) if dex_data else t.buys_h1
@@ -4601,6 +4618,7 @@ async def _finalize_ws_token(mint: str, token_data: dict, chain_id: str, dex_dat
                 launched_at=real_launch,
                 market_cap=mc,
                 volume_usd=dex_data["volume_usd"],
+                volume_h1_total=dex_data.get("volume_h1_total", 0.0),
                 liquidity=dex_data["liquidity"],
                 buy_ratio=dex_data.get("buy_ratio", 0.5),
                 buys_h1=dex_data.get("buys_h1", 0),
@@ -4831,6 +4849,7 @@ async def polling_loop():
                                         launched_at=real_launch,
                                         market_cap=mc,
                                         volume_usd=dex_data["volume_usd"],
+                                        volume_h1_total=dex_data.get("volume_h1_total", 0.0),
                                         liquidity=dex_data["liquidity"],
                                         buy_ratio=dex_data.get("buy_ratio", 0.5),
                                         buys_h1=dex_data.get("buys_h1", 0),
@@ -4861,6 +4880,7 @@ async def polling_loop():
                                         update_mc_velocity(tokens[mint], new_mc)
                                         update_vol_history(tokens[mint], dex_data["volume_usd"])
                                         tokens[mint].volume_usd = dex_data["volume_usd"]
+                                        tokens[mint].volume_h1_total = dex_data.get("volume_h1_total", 0.0)
                                         tokens[mint].market_cap = new_mc
                                         tokens[mint].liquidity = dex_data["liquidity"]
                                         if dex_data.get("launched_at") and not tokens[mint].launched_at:
