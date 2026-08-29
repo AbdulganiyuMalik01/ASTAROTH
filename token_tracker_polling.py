@@ -127,15 +127,20 @@ DEXSCREENER_BOOSTS = "https://api.dexscreener.com/token-boosts/latest/v1"
 # /latest/dex/search?q={term} is the correct free-tier endpoint
 # We search generic terms to get recently active pairs, then filter by chain client-side
 DEXSCREENER_NEW_PAIRS_BY_CHAIN = {
-    "ethereum": "https://api.dexscreener.com/latest/dex/search?q=eth",
-    "bsc":      "https://api.dexscreener.com/latest/dex/search?q=bsc",
-    "base":     "https://api.dexscreener.com/latest/dex/search?q=base",
+    "ethereum":  "https://api.dexscreener.com/latest/dex/search?q=eth",
+    "bsc":       "https://api.dexscreener.com/latest/dex/search?q=bsc",
+    "base":      "https://api.dexscreener.com/latest/dex/search?q=base",
+    # [v4.37] Robinhood Chain — dexscreener.com/robinhood confirms this slug
+    # is indexed (verified 2026-08-29); free-text search on the chain name
+    # mirrors the pattern already used for the other three chains above.
+    "robinhood": "https://api.dexscreener.com/latest/dex/search?q=robinhood",
 }
 # How often to run the dedicated per-chain poll (seconds)
 CHAIN_POLL_INTERVAL = {
-    "ethereum": 30,   # ETH is slower — new pairs every 30s is fine
-    "bsc":      20,   # BSC is faster
-    "base":     20,   # Base is fast
+    "ethereum":  30,   # ETH is slower — new pairs every 30s is fine
+    "bsc":       20,   # BSC is faster
+    "base":      20,   # Base is fast
+    "robinhood": 20,   # New, high-volume meme activity — same cadence as BSC/Base
 }
 
 # [v4.25] Alchemy WS — push-based new-pair detection for BSC/Base/Ethereum.
@@ -158,9 +163,13 @@ def _alchemy_key_for(chain_id: str) -> str:
     return os.getenv(f"ALCHEMY_API_KEY_{chain_id.upper()}", "").strip() or ALCHEMY_API_KEY
 
 ALCHEMY_WS_URLS = {
-    "ethereum": f"wss://eth-mainnet.g.alchemy.com/v2/{_alchemy_key_for('ethereum')}",
-    "bsc":      f"wss://bnb-mainnet.g.alchemy.com/v2/{_alchemy_key_for('bsc')}",
-    "base":     f"wss://base-mainnet.g.alchemy.com/v2/{_alchemy_key_for('base')}",
+    "ethereum":  f"wss://eth-mainnet.g.alchemy.com/v2/{_alchemy_key_for('ethereum')}",
+    "bsc":       f"wss://bnb-mainnet.g.alchemy.com/v2/{_alchemy_key_for('bsc')}",
+    "base":      f"wss://base-mainnet.g.alchemy.com/v2/{_alchemy_key_for('base')}",
+    # [v4.37] Robinhood Chain — Arbitrum Orbit L2, chain id 4663, confirmed
+    # live on Alchemy 2026-07 (per Alchemy's own "Robinhood Chain Mainnet Is
+    # Live" post). Same per-chain-key override pattern: ALCHEMY_API_KEY_ROBINHOOD.
+    "robinhood": f"wss://robinhood-mainnet.g.alchemy.com/v2/{_alchemy_key_for('robinhood')}",
 }
 
 # keccak256 topic0 hashes — identical across every V2/V3-style fork since the
@@ -216,6 +225,19 @@ EVM_FACTORIES = {
         # [v4.30] SushiSwap V3 on Base — same Uniswap V3 fork, same topic0.
         # Address cross-checked against BaseScan's own label ("SushiSwap V3: Factory").
         {"address": "0xc35DADB65012eC5796536bD9864eD8773aBc74C4", "topic": _POOL_CREATED_TOPIC, "dex": "SushiV3"},
+    ],
+    # [v4.37] Robinhood Chain (chain id 4663) — new Arbitrum Orbit L2, live
+    # since ~2026-07. Only Uniswap V3 verified so far, address sourced
+    # directly from Uniswap's own developer deployments doc
+    # (developers.uniswap.org/docs/protocols/v3/deployments/v3-robinhood-chain-deployments,
+    # checked 2026-08-29) — no V2 factory is listed there, and the chain's
+    # active meme-launchpads (robinhood.fun, NOXA Fun, Uniswap's own
+    # Pools.trade) are NOT covered here; those use their own bonding-curve
+    # contracts, not this factory, and would need the same kind of dedicated
+    # decode work four.meme got (deliberately out of scope for this pass —
+    # see the scope note in .env.example).
+    "robinhood": [
+        {"address": "0x1f7d7550b1b028f7571e69a784071f0205fd2efa", "topic": _POOL_CREATED_TOPIC, "dex": "UniswapV3"},
     ],
 }
 
@@ -301,6 +323,25 @@ EVM_BASE_TOKENS = {
         "0x4200000000000000000000000000000000000006",  # WETH
         "0x833589fcd6edb6e08f4c7c32d4f71b54bda02913",  # USDC
     },
+    # [v4.37] Robinhood Chain. WETH address confirmed from Robinhood's own
+    # contracts doc (docs.robinhood.com/chain/contracts, checked 2026-08-29).
+    # Deliberately NOT including USDG (Global Dollar) here yet — it's a real,
+    # confirmed base asset on this chain (see the USDG/WETH Uniswap V3 pool
+    # on GeckoTerminal), but its decimals() couldn't be verified from this
+    # environment (Robinhood's public RPC isn't on the egress allowlist) and
+    # guessing wrong would silently corrupt USD volume math for every
+    # USDG-quoted pair. A meme/USDG pair still gets pre-tracked fine (pair
+    # discovery doesn't depend on base-token recognition) — it just falls
+    # into the existing "neither side recognized" best-effort bucket instead
+    # of getting priced. Add USDG here (+ to EVM_BASE_TOKEN_DECIMALS) once
+    # its decimals are confirmed on-chain or from Paxos's own docs.
+    # Also note: several meme pairs on this chain quote against tokenized
+    # stock tokens (NVDA, COIN, SPY, PLTR, HIMS, ...) instead of WETH/USDG —
+    # those aren't tracked as recognized base assets either, since pricing
+    # them would need a live stock price feed, not a crypto price.
+    "robinhood": {
+        "0x0bd7d308f8e1639fab988df18a8011f41eacad73",  # WETH
+    },
 }
 
 WS_EVM_RECONNECT_DELAY_MIN = 2
@@ -346,6 +387,9 @@ EVM_BASE_TOKEN_DECIMALS = {
         "0x4200000000000000000000000000000000000006": 18,  # WETH
         "0x833589fcd6edb6e08f4c7c32d4f71b54bda02913": 6,     # USDC
     },
+    "robinhood": {
+        "0x0bd7d308f8e1639fab988df18a8011f41eacad73": 18,  # WETH — standard wrapped-native decimals
+    },
 }
 
 # Which base tokens are wrapped-native (priced via WS_*_PRICE_USD) vs
@@ -354,6 +398,7 @@ _EVM_NATIVE_WRAPPED = {
     "0xbb4cdb9cbd36b01bd1cbaebf2de08d9173bc095c": "bnb",   # WBNB
     "0xc02aaa39b223fe8d0a0e5c4f27ead9083c756cc2": "eth",   # WETH (ethereum)
     "0x4200000000000000000000000000000000000006": "eth",  # WETH (base)
+    "0x0bd7d308f8e1639fab988df18a8011f41eacad73": "eth",   # WETH (robinhood)
 }
 
 
@@ -421,6 +466,17 @@ CHAINS: Dict[str, dict] = {
         "label": "ETH",
         "emoji": "🔷",
     },
+    # [v4.37] Robinhood Chain — Arbitrum Orbit L2 (chain id 4663), live since
+    # ~2026-07. Uniswap-V3-pairs coverage only for this pass (see EVM_FACTORIES
+    # comment) — no bonding-curve launchpad coverage yet.
+    "robinhood": {
+        "enabled": _env_bool("ENABLE_ROBINHOOD", True),
+        "has_ws": bool(_alchemy_key_for("robinhood")),
+        "chain_id": "robinhood",
+        "explorer": "https://dexscreener.com/robinhood/{}",
+        "label": "RH",
+        "emoji": "🪶",
+    },
 }
 
 # [v4.10] Per-chain detection thresholds
@@ -479,10 +535,15 @@ def _chain_thresholds(prefix: str, age_min, age_max, mc_min, mc_max,
 #     movers whose volume hasn't caught up to their MC yet.
 # All still per-chain env-overridable if any of these need dialing back.
 CHAIN_THRESHOLDS = {
-    "solana":   _chain_thresholds("SOL",  3 * 60,  6 * 3600, 10_000,        50_000, 0.12, 5_000, 0.50, 8),
-    "bsc":      _chain_thresholds("BSC",  2 * 60, 12 * 3600, 10_000,        50_000, 0.06, 5_000, 0.45, 5),
-    "base":     _chain_thresholds("BASE", 3 * 60,  6 * 3600, 10_000,        50_000, 0.08, 5_000, 0.45, 5),
-    "ethereum": _chain_thresholds("ETH",  2 * 60, 24 * 3600, 10_000,        50_000, 0.04, 5_000, 0.45, 2),
+    "solana":    _chain_thresholds("SOL",  3 * 60,  6 * 3600, 10_000,        50_000, 0.12, 5_000, 0.50, 8),
+    "bsc":       _chain_thresholds("BSC",  2 * 60, 12 * 3600, 10_000,        50_000, 0.06, 5_000, 0.45, 5),
+    "base":      _chain_thresholds("BASE", 3 * 60,  6 * 3600, 10_000,        50_000, 0.08, 5_000, 0.45, 5),
+    "ethereum":  _chain_thresholds("ETH",  2 * 60, 24 * 3600, 10_000,        50_000, 0.04, 5_000, 0.45, 2),
+    # [v4.37] Robinhood Chain — brand new, no live tuning history yet. Starts
+    # as a copy of BSC's thresholds (same "fast, high meme volume" profile
+    # DexScreener's own numbers for this chain suggest) — fully
+    # env-overridable (RH_MC_MIN, RH_AGE_MAX, etc.) once real data comes in.
+    "robinhood": _chain_thresholds("RH",   2 * 60, 12 * 3600, 10_000,        50_000, 0.06, 5_000, 0.45, 5),
 }
 
 def get_thresholds(chain_id: str) -> dict:
@@ -707,7 +768,7 @@ _last_cooldown_cleanup: float = 0.0
 _alert_queue: asyncio.Queue = None
 boosted_mints: Set[str] = set()
 # [v4.11] Per-chain last poll timestamps for staggered chain polling
-_last_chain_poll: dict = {"ethereum": 0.0, "bsc": 0.0, "base": 0.0}
+_last_chain_poll: dict = {"ethereum": 0.0, "bsc": 0.0, "base": 0.0, "robinhood": 0.0}
 
 # [v4.6] WS spam dedup: symbol -> list of (timestamp, mint) tuples seen within cooldown window
 # Used to detect squatter swarms (many different mints sharing the same ticker in a short burst).
@@ -780,7 +841,7 @@ ws_stats = {
 evm_ws_stats: Dict[str, dict] = {
     cid: {"connected": False, "reconnects": 0, "pairs_discovered": 0, "last_message_at": 0.0,
           "trades_received": 0, "swap_subs": 0, "pre_tracked": 0, "fresh_alerts": 0}
-    for cid in ("bsc", "base", "ethereum")
+    for cid in ("bsc", "base", "ethereum", "robinhood")
 }
 
 # [v4.32] KOL/tweet-tracker visibility — both fetch paths (Nitter, RapidAPI)
@@ -804,13 +865,13 @@ KOL_STALE_WARN_THRESHOLD = 20  # roughly ~1-2 KOL_POLL_INTERVAL cycles per handl
 
 # [v4.26] EVM swap/volume feed state — per chain.
 # pair_address(lower) -> {"mint", "base_token", "base_is_token0", "dex"}
-evm_pair_meta: Dict[str, Dict[str, dict]] = {cid: {} for cid in ("bsc", "base", "ethereum")}
+evm_pair_meta: Dict[str, Dict[str, dict]] = {cid: {} for cid in ("bsc", "base", "ethereum", "robinhood")}
 # pair addresses currently included in the live Swap-event subscription
-evm_swap_subscribed: Dict[str, Set[str]] = {cid: set() for cid in ("bsc", "base", "ethereum")}
+evm_swap_subscribed: Dict[str, Set[str]] = {cid: set() for cid in ("bsc", "base", "ethereum", "robinhood")}
 # JSON-RPC subscription id returned by Alchemy for the swap-logs filter (needed
 # to route incoming eth_subscription pushes and to eth_unsubscribe on refresh)
-evm_swap_sub_id: Dict[str, Optional[str]] = {cid: None for cid in ("bsc", "base", "ethereum")}
-evm_factory_sub_id: Dict[str, Optional[str]] = {cid: None for cid in ("bsc", "base", "ethereum")}
+evm_swap_sub_id: Dict[str, Optional[str]] = {cid: None for cid in ("bsc", "base", "ethereum", "robinhood")}
+evm_factory_sub_id: Dict[str, Optional[str]] = {cid: None for cid in ("bsc", "base", "ethereum", "robinhood")}
 
 # [v4.5] Queue for WS-discovered tokens needing DexScreener enrichment
 ws_discovery_queue: asyncio.Queue = None
@@ -3545,7 +3606,7 @@ def format_gem_alert(token: TokenInfo, alert_reason: str = "GEM", distro: "Distr
     if is_vol_accelerating(token):       badges.append("📈 Vol↑")
     if token.ws_discovered:              badges.append("⚡ Live")
     if token.is_boosted:                 badges.append("🚀 Boosted")
-    if token.chain_id in ("ethereum", "bsc", "base") and token.buy_volume_h1 > 0:
+    if token.chain_id in ("ethereum", "bsc", "base", "robinhood") and token.buy_volume_h1 > 0:
         badges.append(f"💰 {fmt_usd_short(token.buy_volume_h1)} buy")
     if token.price_change_h1 and abs(token.price_change_h1) > 1:
         arrow = "▲" if token.price_change_h1 > 0 else "▼"
@@ -3565,6 +3626,12 @@ def format_gem_alert(token: TokenInfo, alert_reason: str = "GEM", distro: "Distr
         links = f"<a href='{_dex_url}'>DEX</a> · <a href='https://basescan.org/token/{token.mint}'>Scan</a>"
     elif token.chain_id == "ethereum":
         links = f"<a href='{_dex_url}'>DEX</a> · <a href='https://etherscan.io/token/{token.mint}'>Scan</a>"
+    elif token.chain_id == "robinhood":
+        # [v4.37] hoodexplorer.org — Blockscout-style explorer for Robinhood
+        # Chain. URL pattern not independently verified against a live page
+        # (fetch blocked by its robots.txt from this environment); cosmetic
+        # link only, worst case a 404, no effect on detection/alerting.
+        links = f"<a href='{_dex_url}'>DEX</a> · <a href='https://www.hoodexplorer.org/token/{token.mint}'>Scan</a>"
     else:
         links = f"<a href='{_dex_url}'>DEX</a>"
 
@@ -3625,6 +3692,7 @@ ETH_WHALE_M5_MC      = 0.05      # 5-min vol >= 5% of MC = potential whale entry
 ETH_VOL_ACCEL_MIN    = 1.5       # current vol >= 1.5x avg of previous polls = accelerating
 BSC_MIN_BUY_VOL_H1   = 8_000     # BSC has lower USD values — $8k is meaningful
 BASE_MIN_BUY_VOL_H1  = 5_000     # Base is smaller — $5k buy vol is signal
+RH_MIN_BUY_VOL_H1    = 8_000     # [v4.37] Robinhood Chain — no tuning history yet, starts at BSC's level
 
 
 def is_buy_vol_significant(token: TokenInfo) -> bool:
@@ -3638,7 +3706,7 @@ def is_buy_vol_significant(token: TokenInfo) -> bool:
     - OR 5-min vol spike relative to MC (whale entry detection)
     """
     chain = token.chain_id
-    if chain not in ("ethereum", "bsc", "base"):
+    if chain not in ("ethereum", "bsc", "base", "robinhood"):
         return False  # Solana uses transaction count, not this
 
     vol = token.buy_volume_h1
@@ -3651,6 +3719,8 @@ def is_buy_vol_significant(token: TokenInfo) -> bool:
         min_vol = ETH_MIN_BUY_VOL_H1
     elif chain == "bsc":
         min_vol = BSC_MIN_BUY_VOL_H1
+    elif chain == "robinhood":
+        min_vol = RH_MIN_BUY_VOL_H1
     else:
         min_vol = BASE_MIN_BUY_VOL_H1
 
@@ -4002,7 +4072,7 @@ async def run_detections(token: TokenInfo, session: aiohttp.ClientSession = None
         # Separate from Solana's txn-count based detection.
         # Triggers when buy-side USD volume shows real accumulation pressure.
         eth_vol_signal = (
-            token.chain_id in ("ethereum", "bsc", "base")
+            token.chain_id in ("ethereum", "bsc", "base", "robinhood")
             and is_buy_vol_significant(token)
             and buy_ratio_ok
             and liq_ok
@@ -4015,7 +4085,7 @@ async def run_detections(token: TokenInfo, session: aiohttp.ClientSession = None
         )
 
         eth_vol_accel = (
-            token.chain_id in ("ethereum", "bsc", "base")
+            token.chain_id in ("ethereum", "bsc", "base", "robinhood")
             and is_buy_vol_accelerating(token)
             and is_buy_vol_significant(token)
             and liq_ok
@@ -4048,7 +4118,7 @@ async def run_detections(token: TokenInfo, session: aiohttp.ClientSession = None
             and (
                 token.mc_velocity >= GEM_FAST_VELOCITY
                 or is_vol_accelerating(token)
-                or (token.chain_id in ("ethereum", "bsc", "base") and is_buy_vol_accelerating(token))
+                or (token.chain_id in ("ethereum", "bsc", "base", "robinhood") and is_buy_vol_accelerating(token))
             )
             and price_not_crashing and mc_not_collapsed and not_suppressed
         )
@@ -4084,7 +4154,7 @@ async def run_detections(token: TokenInfo, session: aiohttp.ClientSession = None
         # DexScreener enriches (liquidity becomes > 0) and the normal paths
         # take over from there.
         evm_fresh_momentum = False
-        if (token.chain_id in ("ethereum", "bsc", "base")
+        if (token.chain_id in ("ethereum", "bsc", "base", "robinhood")
                 and token.ws_pre_enrichment and token.liquidity == 0):
             ws_total_fresh = token.ws_buy_count + token.ws_sell_count
             ws_usd_fresh = token.ws_buy_vol_usd + token.ws_sell_vol_usd
@@ -4580,8 +4650,8 @@ async def polling_loop():
                     # Fallback: fetch tokens WS may have missed (Solana primary)
                     new_tokens = await fetch_new_tokens(session)
 
-                    # [v4.11] Dedicated per-chain discovery for ETH/BSC/Base
-                    for cid in ["ethereum", "bsc", "base"]:
+                    # [v4.11] Dedicated per-chain discovery for ETH/BSC/Base/Robinhood
+                    for cid in ["ethereum", "bsc", "base", "robinhood"]:
                         if cid not in ENABLED_CHAIN_IDS:
                             continue
                         interval = CHAIN_POLL_INTERVAL.get(cid, 30)
@@ -4770,7 +4840,7 @@ async def lifespan(app: FastAPI):
     # (i.e. ALCHEMY_API_KEY is set). No-ops harmlessly per-chain otherwise.
     evm_ws_tasks = [
         asyncio.create_task(evm_ws_listener(cid))
-        for cid in ("bsc", "base", "ethereum")
+        for cid in ("bsc", "base", "ethereum", "robinhood")
         if get_chain(cid)["enabled"] and get_chain(cid)["has_ws"]
     ]
 
