@@ -551,20 +551,23 @@ def _chain_thresholds(prefix: str, age_min, age_max, mc_min, mc_max,
 # re-checking a token later if it was outside the window the first time it
 # was seen (see the entry-gate comments at each tokens[mint] = TokenInfo(...)
 # creation site). Concretely:
-#   - solana:   MC $10k-$30k,  volume $10k-$30k
-#   - bsc/base/ethereum/robinhood (all EVM chains): MC $5k-$50k, volume $10k-$50k
+#   - solana:   MC $10k-$30k,  volume $5k-$30k
+#   - bsc/base/ethereum/robinhood (all EVM chains): MC $5k-$50k, volume $5k-$50k
 # Both are per-chain env-overridable (SOL_MC_MIN/SOL_VOL_MAX/BSC_MC_MIN/etc.)
 # same as every other threshold here.
+# [v4.44] vol_min lowered from $10k to $5k across every chain, per user
+# request. See effective_liq_vol_buyratio for the matching change to what
+# "volume" itself means here (buy-side only now, not total buy+sell).
 CHAIN_THRESHOLDS = {
-    "solana":    _chain_thresholds("SOL",  3 * 60,  6 * 3600, 10_000, 30_000, 10_000, 30_000, 5_000, 0.50, 8),
-    "bsc":       _chain_thresholds("BSC",  2 * 60, 12 * 3600,  5_000, 50_000, 10_000, 50_000, 5_000, 0.45, 5),
-    "base":      _chain_thresholds("BASE", 3 * 60,  6 * 3600,  5_000, 50_000, 10_000, 50_000, 5_000, 0.45, 5),
-    "ethereum":  _chain_thresholds("ETH",  2 * 60, 24 * 3600,  5_000, 50_000, 10_000, 50_000, 5_000, 0.45, 2),
+    "solana":    _chain_thresholds("SOL",  3 * 60,  6 * 3600, 10_000, 30_000,  5_000, 30_000, 5_000, 0.50, 8),
+    "bsc":       _chain_thresholds("BSC",  2 * 60, 12 * 3600,  5_000, 50_000,  5_000, 50_000, 5_000, 0.45, 5),
+    "base":      _chain_thresholds("BASE", 3 * 60,  6 * 3600,  5_000, 50_000,  5_000, 50_000, 5_000, 0.45, 5),
+    "ethereum":  _chain_thresholds("ETH",  2 * 60, 24 * 3600,  5_000, 50_000,  5_000, 50_000, 5_000, 0.45, 2),
     # [v4.37] Robinhood Chain — brand new, no live tuning history yet. Starts
     # as a copy of BSC's thresholds (same "fast, high meme volume" profile
     # DexScreener's own numbers for this chain suggest) — fully
     # env-overridable (RH_MC_MIN, RH_AGE_MAX, etc.) once real data comes in.
-    "robinhood": _chain_thresholds("RH",   2 * 60, 12 * 3600,  5_000, 50_000, 10_000, 50_000, 5_000, 0.45, 5),
+    "robinhood": _chain_thresholds("RH",   2 * 60, 12 * 3600,  5_000, 50_000,  5_000, 50_000, 5_000, 0.45, 5),
 }
 
 def get_thresholds(chain_id: str) -> dict:
@@ -1200,10 +1203,17 @@ def effective_liq_vol_buyratio(token: TokenInfo) -> tuple:
     a misleading $0 Vol/Liq on an alert that fired specifically because of
     real bonding-curve activity).
     """
+    # [v4.44] Every branch below returns BUY-side volume only (not buy+sell)
+    # per user request -- sell volume is dump pressure, not the "is this
+    # getting bought up" signal the vol_ok/vol_ok_momentum entry-gate bands
+    # are meant to measure. Combined with vol_min dropping to $5k (see
+    # CHAIN_THRESHOLDS), this makes the gate noticeably easier to clear on
+    # its volume side than the two prior designs (the original vol/mc ratio,
+    # then the v4.39-v4.42 total-dollar-band).
     if token.chain_id == "solana" and token.liquidity == 0:
         ws_total = token.ws_buy_count + token.ws_sell_count
         liq = token.ws_liquidity_estimate
-        vol = token.ws_buy_vol_usd + token.ws_sell_vol_usd
+        vol = token.ws_buy_vol_usd  # real buy-side volume from live WS trades
         buy_ratio = token.ws_buy_count / max(ws_total, 1) if ws_total >= 5 else token.buy_ratio
         return liq, vol, buy_ratio
     # [v4.35] Same fallback for a BSC four.meme pre-migration stub — real
@@ -1213,7 +1223,7 @@ def effective_liq_vol_buyratio(token: TokenInfo) -> tuple:
     if token.chain_id == "bsc" and token.ws_pre_enrichment and token.liquidity == 0:
         ws_total = token.ws_buy_count + token.ws_sell_count
         liq = token.fourmeme_raised_usd
-        vol = token.ws_buy_vol_usd + token.ws_sell_vol_usd
+        vol = token.ws_buy_vol_usd  # real buy-side volume from live WS trades
         buy_ratio = token.ws_buy_count / max(ws_total, 1) if ws_total >= 5 else token.buy_ratio
         return liq, vol, buy_ratio
     # [v4.36] Generic pre-DexScreener-index fallback for vanilla EVM DEX pairs
@@ -1224,16 +1234,18 @@ def effective_liq_vol_buyratio(token: TokenInfo) -> tuple:
     # the dataclass default (0 / 0.5) for the whole pre-enrichment window.
     if token.ws_pre_enrichment and token.liquidity == 0:
         ws_total = token.ws_buy_count + token.ws_sell_count
-        vol = token.ws_buy_vol_usd + token.ws_sell_vol_usd
+        vol = token.ws_buy_vol_usd  # real buy-side volume from live WS trades
         buy_ratio = token.ws_buy_count / max(ws_total, 1) if ws_total >= 5 else token.buy_ratio
         return token.liquidity, vol, buy_ratio
-    # [v4.42] Real DexScreener data available -- use actual total 1h volume
-    # (buy+sell) instead of token.volume_usd, which is really an estimated
-    # buy-only slice of h1 volume (see get_dex_data / TokenInfo.volume_usd
-    # vs volume_h1_total). The vol_ok/vol_ok_momentum entry-gate bands in
-    # run_detections, and the "Vol:" figure shown on the alert card, both
-    # come from this return value -- both now reflect real 1h volume.
-    return token.liquidity, token.volume_h1_total, token.buy_ratio
+    # [v4.44] Real DexScreener data available -- use buy_volume_h1 (DexScreener
+    # doesn't split its h1 volume into buy/sell dollar amounts, so this is
+    # still h1_vol * buy_ratio under the hood, see get_dex_data -- the best
+    # buy-only estimate available from that API) instead of volume_h1_total
+    # (v4.42's real-total figure, one message ago) or volume_usd (same
+    # buy_volume_h1 number, just not kept in sync after token creation --
+    # see the TokenInfo(...) call sites in _finalize_ws_token / the polling
+    # loop, which is why this reads buy_volume_h1 specifically).
+    return token.liquidity, token.buy_volume_h1, token.buy_ratio
 
 
 def update_vol_history(token: TokenInfo, new_vol: float):
@@ -4710,6 +4722,7 @@ async def _finalize_ws_token(mint: str, token_data: dict, chain_id: str, dex_dat
             t.last_mc = t.market_cap
             t.volume_usd = dex_data["volume_usd"] if dex_data else t.volume_usd
             t.volume_h1_total = dex_data.get("volume_h1_total", 0.0) if dex_data else t.volume_h1_total
+            t.buy_volume_h1 = dex_data.get("buy_volume_h1", 0.0) if dex_data else t.buy_volume_h1
             t.liquidity = dex_data["liquidity"] if dex_data else t.liquidity
             t.buy_ratio = dex_data.get("buy_ratio", t.buy_ratio) if dex_data else t.buy_ratio
             t.buys_h1 = dex_data.get("buys_h1", t.buys_h1) if dex_data else t.buys_h1
@@ -4748,6 +4761,11 @@ async def _finalize_ws_token(mint: str, token_data: dict, chain_id: str, dex_dat
                 market_cap=mc,
                 volume_usd=dex_data["volume_usd"],
                 volume_h1_total=dex_data.get("volume_h1_total", 0.0),
+                # [v4.44] Was left at its 0.0 default until the next poll
+                # refresh (see the enrich loop below) populated it -- meaning
+                # the buy-only vol_ok gate this now feeds would spuriously
+                # fail for a token's entire first poll cycle after creation.
+                buy_volume_h1=dex_data.get("buy_volume_h1", 0.0),
                 liquidity=dex_data["liquidity"],
                 buy_ratio=dex_data.get("buy_ratio", 0.5),
                 buys_h1=dex_data.get("buys_h1", 0),
@@ -4979,6 +4997,7 @@ async def polling_loop():
                                         market_cap=mc,
                                         volume_usd=dex_data["volume_usd"],
                                         volume_h1_total=dex_data.get("volume_h1_total", 0.0),
+                                        buy_volume_h1=dex_data.get("buy_volume_h1", 0.0),
                                         liquidity=dex_data["liquidity"],
                                         buy_ratio=dex_data.get("buy_ratio", 0.5),
                                         buys_h1=dex_data.get("buys_h1", 0),
