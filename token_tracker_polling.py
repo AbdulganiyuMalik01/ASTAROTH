@@ -118,6 +118,9 @@ rate_limiter = RateLimiter(
 )
 
 DEXSCREENER_API = "https://api.dexscreener.com/latest/dex"
+# [v4.43] GoPlus Security API — free, no key required, used to screen EVM
+# tokens for honeypot/scam red flags before they go out in an alert.
+GOPLUS_API = "https://api.gopluslabs.io/api/v1"
 DEXSCREENER_NEW_PAIRS = "https://api.dexscreener.com/token-profiles/latest/v1"
 DEXSCREENER_SEARCH = "https://api.dexscreener.com/latest/dex/search"
 DEXSCREENER_BOOSTS = "https://api.dexscreener.com/token-boosts/latest/v1"
@@ -3671,7 +3674,7 @@ def fmt_usd_short(v: float) -> str:
     return f"${v:.0f}"
 
 
-def format_gem_alert(token: TokenInfo, alert_reason: str = "GEM", distro: "DistroResult" = None) -> str:
+def format_gem_alert(token: TokenInfo, alert_reason: str = "GEM", distro: "DistroResult" = None, security: "SecurityResult" = None) -> str:
     age_str = format_launch_age(token.launched_at or token.created_at)
     chain = get_chain(token.chain_id)
     _dex_url = dex_url(token.mint, token.chain_id)
@@ -3756,6 +3759,11 @@ def format_gem_alert(token: TokenInfo, alert_reason: str = "GEM", distro: "Distr
     ]
     if badges:
         lines.append("  ".join(badges[:4]))
+    # [v4.43] GoPlus security warning — always shown in full (not subject to
+    # the badges[:4] cap above) since the whole point is that the user
+    # actually sees it, not that it gets silently crowded out.
+    if security and security.checked and security.has_risk:
+        lines.append("⚠️ <b>Security:</b> " + " · ".join(security.risk_reasons[:4]))
     lines += [
         f"<code>{token.mint}</code>",
         links,
@@ -3885,6 +3893,113 @@ DISTRO_TOP1_MAX  = 0.25      # block if any single wallet holds >25%
 BUNDLE_WINDOW_S  = 4         # seconds — buys within this window = bundle
 BUNDLE_MIN_WALLETS = 5       # min distinct wallets buying in window = bundle
 DISTRO_TIMEOUT   = 4.0       # seconds max to spend on Helius call
+
+# [v4.43] EVM scam/honeypot screening (GoPlus Token Security API), per user
+# request. Chosen strictness: "honeypot + tax + owner risk" -- flags any of
+# a true honeypot, an extreme buy/sell tax, or the deployer retaining
+# dangerous privileges (mint more supply, blacklist/hide the owner, pause
+# trading, self-destruct). Per user's explicit choice this only WARNS
+# (adds a "⚠️ Security" line to the alert card, see format_gem_alert) --
+# it never blocks an alert, unlike the Solana distro/bundle check above.
+GOPLUS_CHAIN_IDS = {
+    "ethereum": "1",
+    "bsc": "56",
+    "base": "8453",
+    # Robinhood Chain (4663) isn't indexed by GoPlus yet -- absent from this
+    # map means check_evm_token_security no-ops for it, same as any other
+    # unsupported chain or a failed/timed-out lookup (fail open: no badge,
+    # alert proceeds exactly as it would with no security data at all).
+}
+SECURITY_CHECK_TIMEOUT = 5.0
+SECURITY_HIGH_TAX_PCT = float(os.getenv("SECURITY_HIGH_TAX_PCT", "25"))  # buy/sell tax %% considered a red flag
+
+
+@dataclass
+class SecurityResult:
+    checked: bool = False          # True only if GoPlus actually returned data
+    is_honeypot: bool = False
+    buy_tax_pct: float = 0.0
+    sell_tax_pct: float = 0.0
+    high_tax: bool = False
+    owner_risk: bool = False
+    risk_reasons: List[str] = field(default_factory=list)
+
+    @property
+    def has_risk(self) -> bool:
+        return self.is_honeypot or self.high_tax or self.owner_risk
+
+
+async def check_evm_token_security(session: aiohttp.ClientSession, chain_id: str, token_address: str) -> SecurityResult:
+    """
+    [v4.43] Screens an EVM token through GoPlus's free Token Security API
+    for honeypot / high-tax / dangerous-owner-privilege red flags. Fails
+    open on anything unexpected (unsupported chain, API down/slow,
+    malformed response) -- returns checked=False and the alert proceeds
+    exactly as it would with no security data, since this check only ever
+    adds a warning badge and must never be able to suppress a real alert.
+    """
+    result = SecurityResult()
+    goplus_chain = GOPLUS_CHAIN_IDS.get(chain_id)
+    if not goplus_chain or not token_address:
+        return result
+    try:
+        url = f"{GOPLUS_API}/token_security/{goplus_chain}"
+        async with session.get(
+            url,
+            params={"contract_addresses": token_address.lower()},
+            timeout=aiohttp.ClientTimeout(total=SECURITY_CHECK_TIMEOUT),
+        ) as resp:
+            if resp.status != 200:
+                return result
+            data = await resp.json()
+            info = (data.get("result") or {}).get(token_address.lower())
+            if not info:
+                return result
+
+            result.checked = True
+
+            def _flag(key: str) -> bool:
+                return str(info.get(key, "0")) == "1"
+
+            def _pct(key: str) -> float:
+                try:
+                    return float(info.get(key, 0) or 0) * 100
+                except (TypeError, ValueError):
+                    return 0.0
+
+            result.is_honeypot = _flag("is_honeypot")
+            result.buy_tax_pct = _pct("buy_tax")
+            result.sell_tax_pct = _pct("sell_tax")
+            result.high_tax = (
+                result.buy_tax_pct >= SECURITY_HIGH_TAX_PCT
+                or result.sell_tax_pct >= SECURITY_HIGH_TAX_PCT
+            )
+            result.owner_risk = (
+                _flag("is_mintable") or _flag("hidden_owner")
+                or _flag("can_take_back_ownership") or _flag("owner_change_balance")
+                or _flag("selfdestruct") or _flag("transfer_pausable")
+            )
+
+            if result.is_honeypot:
+                result.risk_reasons.append("Honeypot (can't sell)")
+            if result.high_tax:
+                result.risk_reasons.append(f"Tax {result.buy_tax_pct:.0f}%/{result.sell_tax_pct:.0f}% buy/sell")
+            if _flag("is_mintable"):
+                result.risk_reasons.append("Mintable supply")
+            if _flag("hidden_owner"):
+                result.risk_reasons.append("Hidden owner")
+            if _flag("can_take_back_ownership"):
+                result.risk_reasons.append("Ownership reclaimable")
+            if _flag("owner_change_balance"):
+                result.risk_reasons.append("Owner can edit balances")
+            if _flag("selfdestruct"):
+                result.risk_reasons.append("Selfdestruct function")
+            if _flag("transfer_pausable"):
+                result.risk_reasons.append("Trading pausable")
+
+    except Exception as e:
+        logger.debug(f"GoPlus security check error ({chain_id} {token_address[:10] if token_address else '?'}...): {e}")
+    return result
 
 @dataclass
 class DistroResult:
@@ -4359,6 +4474,20 @@ async def run_detections(token: TokenInfo, session: aiohttp.ClientSession = None
                 })
                 return  # silently drop — don't alert on bundled/concentrated tokens
 
+            # [v4.43] EVM scam/honeypot screening (GoPlus), warn-only per user
+            # choice — never blocks the alert, only adds a badge below.
+            security = SecurityResult()
+            if token.chain_id in GOPLUS_CHAIN_IDS:
+                try:
+                    security = await asyncio.wait_for(
+                        check_evm_token_security(session, token.chain_id, token.mint),
+                        timeout=SECURITY_CHECK_TIMEOUT + 1
+                    )
+                except Exception as e:
+                    logger.debug(f"Security check error for {token.mint[:10]}: {e}")
+                if security.checked and security.has_risk:
+                    logger.info(f"⚠️ Security flag [{token.symbol}]: {', '.join(security.risk_reasons)}")
+
             token.alerted = True
             token.last_alerted = now
             token.alert_mc = mc
@@ -4367,7 +4496,7 @@ async def run_detections(token: TokenInfo, session: aiohttp.ClientSession = None
             alerted_symbol_registry[token.symbol.upper().strip()] = {
                 "mint": token.mint, "chain_id": token.chain_id, "alerted_at": now,
             }
-            msg_id = await _send_telegram_direct(format_gem_alert(token, alert_reason, distro))
+            msg_id = await _send_telegram_direct(format_gem_alert(token, alert_reason, distro, security))
             if msg_id:
                 token.alert_message_id = msg_id  # store for reply-threading
             src = "⚡WS" if token.ws_discovered else "📡Poll"
