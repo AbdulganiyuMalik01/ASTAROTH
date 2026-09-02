@@ -1346,24 +1346,38 @@ async def prune_dead_tokens():
         for mint, token in tokens.items():
             age = now - token.created_at
             if age > TOKEN_MAX_AGE_SECONDS:
-                to_remove.append((mint, token.symbol, "6h"))
+                to_remove.append((mint, token.symbol, "6h", token.alerted))
                 continue
             if age > TOKEN_STALE_AGE_SECONDS and not token.alerted:
                 if token.volume_usd < TOKEN_STALE_VOL_THRESHOLD:
-                    to_remove.append((mint, token.symbol, "stale"))
-        for mint, sym, reason in to_remove:
+                    to_remove.append((mint, token.symbol, "stale", False))
+        for mint, sym, reason, was_alerted in to_remove:
             del tokens[mint]
             volume_history.pop(mint, None)
-            seen_mints.discard(mint)  # [fix] allow re-discovery after pruning
+            # [fix] allow re-discovery after pruning -- but NOT for a mint that
+            # already fired a real alert. Before this guard, an already-alerted
+            # token that simply outlived TOKEN_MAX_AGE_SECONDS (6h) got dropped
+            # from `tokens` AND unconditionally discarded from `seen_mints`,
+            # so the very next poll cycle that still saw it trading treated it
+            # as a brand-new token (fresh TokenInfo, alerted=False) and it could
+            # re-fire the exact same alert repeatedly (observed live: $GREENAPPLE
+            # re-alerted 4x over 14min on Robinhood Chain, MC drifting up each
+            # time, well past 11h old -- pure alert-spam on a token already
+            # surfaced, at the direct expense of alert bandwidth that should go
+            # to genuinely new candidates). Never-alerted stale tokens still get
+            # the re-discovery fix as before, since those legitimately might
+            # show real life later.
+            if not was_alerted:
+                seen_mints.discard(mint)
             _release_sol_ws_subscription(mint)  # [v4.46] free its trade-feed slot, if it had one
     if to_remove:
-        sample = ", ".join(f"${s}" for _, s, _ in to_remove[:5])
+        sample = ", ".join(f"${s}" for _, s, _, _ in to_remove[:5])
         suffix = "..." if len(to_remove) > 5 else ""
         logger.info(f"🗑️ Pruned {len(to_remove)} dead tokens ({sample}{suffix}) | Pool: {len(tokens)}")
 
         # [v4.26] Drop evm_pair_meta entries for pruned tokens too, else the
         # swap-feed metadata dict grows unbounded over long uptimes.
-        pruned_mints = {mint for mint, _, _ in to_remove}
+        pruned_mints = {mint for mint, _, _, _ in to_remove}
         for cid_meta in evm_pair_meta.values():
             stale_pairs = [p for p, info in cid_meta.items() if info["mint"] in pruned_mints]
             for p in stale_pairs:
