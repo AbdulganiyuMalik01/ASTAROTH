@@ -558,16 +558,23 @@ def _chain_thresholds(prefix: str, age_min, age_max, mc_min, mc_max,
 # [v4.44] vol_min lowered from $10k to $5k across every chain, per user
 # request. See effective_liq_vol_buyratio for the matching change to what
 # "volume" itself means here (buy-side only now, not total buy+sell).
+# [v4.46] mc_max/vol_max widened (~2.5x) per user request, one of three
+# levers picked to address "misses most of the day's best tokens" -- with
+# RUNNER🚀 staying off (user's choice) and entry still one-shot-only until
+# the re-check mechanism below lands, the entry-tier ceiling is the ONLY
+# way any token can ever be caught, so a narrow ceiling was directly
+# capping how many real winners could ever qualify, independent of the
+# one-shot-vs-recheck question. Still fully env-overridable per chain.
 CHAIN_THRESHOLDS = {
-    "solana":    _chain_thresholds("SOL",  3 * 60,  6 * 3600, 10_000, 30_000,  5_000, 30_000, 5_000, 0.50, 8),
-    "bsc":       _chain_thresholds("BSC",  2 * 60, 12 * 3600,  5_000, 50_000,  5_000, 50_000, 5_000, 0.45, 5),
-    "base":      _chain_thresholds("BASE", 3 * 60,  6 * 3600,  5_000, 50_000,  5_000, 50_000, 5_000, 0.45, 5),
-    "ethereum":  _chain_thresholds("ETH",  2 * 60, 24 * 3600,  5_000, 50_000,  5_000, 50_000, 5_000, 0.45, 2),
+    "solana":    _chain_thresholds("SOL",  3 * 60,  6 * 3600, 10_000,  75_000,  5_000,  75_000, 5_000, 0.50, 8),
+    "bsc":       _chain_thresholds("BSC",  2 * 60, 12 * 3600,  5_000, 150_000,  5_000, 150_000, 5_000, 0.45, 5),
+    "base":      _chain_thresholds("BASE", 3 * 60,  6 * 3600,  5_000, 150_000,  5_000, 150_000, 5_000, 0.45, 5),
+    "ethereum":  _chain_thresholds("ETH",  2 * 60, 24 * 3600,  5_000, 150_000,  5_000, 150_000, 5_000, 0.45, 2),
     # [v4.37] Robinhood Chain — brand new, no live tuning history yet. Starts
     # as a copy of BSC's thresholds (same "fast, high meme volume" profile
     # DexScreener's own numbers for this chain suggest) — fully
     # env-overridable (RH_MC_MIN, RH_AGE_MAX, etc.) once real data comes in.
-    "robinhood": _chain_thresholds("RH",   2 * 60, 12 * 3600,  5_000, 50_000,  5_000, 50_000, 5_000, 0.45, 5),
+    "robinhood": _chain_thresholds("RH",   2 * 60, 12 * 3600,  5_000, 150_000,  5_000, 150_000, 5_000, 0.45, 5),
 }
 
 def get_thresholds(chain_id: str) -> dict:
@@ -799,18 +806,53 @@ boosted_mints: Set[str] = set()
 # [v4.11] Per-chain last poll timestamps for staggered chain polling
 _last_chain_poll: dict = {"ethereum": 0.0, "bsc": 0.0, "base": 0.0, "robinhood": 0.0}
 
-# [v4.40] Solana pending-entry state — see _handle_ws_create/_finalize_sol_pending_entry.
+# [v4.40 -> v4.46] Solana pending-entry state — see
+# _handle_ws_create/_finalize_sol_pending_entry.
 # mint -> {"symbol", "name", "created_at", "mc_sol", "vsol_curve", "initial_buy",
 #          "ws_buy_count", "ws_sell_count", "ws_buy_vol_usd", "ws_sell_vol_usd"}
-# A brand-new pump.fun mint lands here (NOT in `tokens`) the instant it's created;
-# it's promoted to `tokens` (or dropped for good) exactly once, when its one-shot
-# delayed check fires. Never re-checked after that either way.
+# A brand-new pump.fun mint lands here (NOT in `tokens`) the instant it's created.
+# [v4.46] Was one-shot (a single check at SOL_ENTRY_CHECK_DELAY, drop forever on
+# a miss) -- per user request ("misses most of the day's best tokens"), this is
+# now a recurring check: still starts after SOL_ENTRY_CHECK_DELAY, but re-checks
+# every SOL_PENDING_RECHECK_INTERVAL until either promoted or SOL_PENDING_MAX_AGE
+# is reached, so a token that's merely climbing slowly isn't punished for missing
+# one arbitrary instant. See _finalize_sol_pending_entry.
 _pending_sol_entries: Dict[str, dict] = {}
 SOL_ENTRY_CHECK_DELAY = float(os.getenv("SOL_ENTRY_CHECK_DELAY", "45"))
+SOL_PENDING_RECHECK_INTERVAL = float(os.getenv("SOL_PENDING_RECHECK_INTERVAL", "20"))
+SOL_PENDING_MAX_AGE = float(os.getenv("SOL_PENDING_MAX_AGE", "900"))  # 15 min
 # Trade-feed subscription slots reserved for pending mints, out of the shared
 # WS_MAX_TRADE_SUBS=50 PumpPortal cap (the rest stays available for already-
 # alerted tokens, which use the same subscription pool via ws_sub_request_queue).
-SOL_PENDING_SUB_CAP = int(os.getenv("SOL_PENDING_SUB_CAP", "15"))
+# [v4.46] Raised 15->30: pending mints now live up to SOL_PENDING_MAX_AGE (15min)
+# instead of SOL_ENTRY_CHECK_DELAY (45s), so far more are pending at once and
+# need a live feed to ever have a chance to climb into the window. Paired with
+# ws_subscribed_mints/ws_unsub_request_queue below actually releasing slots on
+# drop -- raising this cap without that fix would have just leaked faster.
+SOL_PENDING_SUB_CAP = int(os.getenv("SOL_PENDING_SUB_CAP", "30"))
+# [v4.46] Single shared source of truth for what's actually subscribed on
+# PumpPortal's end, across BOTH request paths (pending-mint requests here,
+# newly-alerted requests in ws_trade_subscription_manager) -- previously each
+# path tracked its own local/nonexistent bookkeeping, so the two together
+# could silently try to exceed the real 50-slot cap. Also lets a drop (stale
+# prune, or a pending mint aging out) actually free its slot via
+# ws_unsub_request_queue instead of leaking it for the rest of the process's
+# uptime, which is what let the pool quietly clog with dead mints before.
+ws_subscribed_mints: Set[str] = set()
+ws_unsub_request_queue: asyncio.Queue = None  # side-channel for trade unsub requests, same shape as ws_sub_request_queue
+
+# [v4.46] EVM equivalent of _pending_sol_entries. EVM chains have no free
+# live on-chain MC feed the way Solana's bonding curve does (a PairCreated
+# swap event carries no reserves), so "keep checking" here means periodic
+# DexScreener re-fetches instead of an in-memory recheck -- bounded on both
+# ends (EVM_PENDING_CAP, EVM_PENDING_RECHECK_BATCH) to stay well inside
+# DexScreener's rate limit regardless of how many tokens are pending.
+# mint -> {"chain_id", "symbol", "name", "created_at", "last_checked_at", "ws_discovered"}
+_pending_evm_entries: Dict[str, dict] = {}
+EVM_PENDING_RECHECK_INTERVAL = float(os.getenv("EVM_PENDING_RECHECK_INTERVAL", "60"))
+EVM_PENDING_MAX_AGE = float(os.getenv("EVM_PENDING_MAX_AGE", "900"))  # 15 min
+EVM_PENDING_CAP = int(os.getenv("EVM_PENDING_CAP", "400"))  # drop new arrivals once this many are already waiting
+EVM_PENDING_RECHECK_BATCH = int(os.getenv("EVM_PENDING_RECHECK_BATCH", "25"))  # per-cycle DexScreener call cap
 
 # [v4.6] WS spam dedup: symbol -> list of (timestamp, mint) tuples seen within cooldown window
 # Used to detect squatter swarms (many different mints sharing the same ticker in a short burst).
@@ -1313,6 +1355,7 @@ async def prune_dead_tokens():
             del tokens[mint]
             volume_history.pop(mint, None)
             seen_mints.discard(mint)  # [fix] allow re-discovery after pruning
+            _release_sol_ws_subscription(mint)  # [v4.46] free its trade-feed slot, if it had one
     if to_remove:
         sample = ", ".join(f"${s}" for _, s, _ in to_remove[:5])
         suffix = "..." if len(to_remove) > 5 else ""
@@ -2369,9 +2412,14 @@ async def _handle_ws_create(data: dict):
         "ws_buy_count": 0, "ws_sell_count": 0,
         "ws_buy_vol_usd": 0.0, "ws_sell_vol_usd": 0.0,
     }
-    if len(_pending_sol_entries) <= SOL_PENDING_SUB_CAP and ws_sub_request_queue is not None:
+    # [v4.46] Reserve at most SOL_PENDING_SUB_CAP of the shared 50-slot pool
+    # for pending mints -- ws_subscribed_mints is the single shared count
+    # across this AND ws_trade_subscription_manager's alerted-token requests,
+    # so this naturally leaves the rest of the pool free for alerted tokens.
+    if len(ws_subscribed_mints) < SOL_PENDING_SUB_CAP and ws_sub_request_queue is not None:
         try:
             ws_sub_request_queue.put_nowait([mint])
+            ws_subscribed_mints.add(mint)
         except asyncio.QueueFull:
             pass  # no live updates for this one during its window -- it'll just be
                    # judged on its creation-time snapshot when the delayed check fires
@@ -2390,53 +2438,85 @@ async def _handle_ws_create(data: dict):
         })
 
 
+def _release_sol_ws_subscription(mint: str) -> None:
+    """
+    [v4.46] Frees a pending mint's trade-feed subscription slot -- both the
+    local accounting (ws_subscribed_mints) and the actual PumpPortal-side
+    subscription (via ws_unsub_request_queue). Call this on every path that
+    stops watching a mint without it ever being promoted to `tokens` (a
+    promoted mint keeps its live feed -- see run_detections/alerting, which
+    still benefits from it), so slots get reused instead of leaking for the
+    rest of the process's uptime.
+    """
+    if mint in ws_subscribed_mints:
+        ws_subscribed_mints.discard(mint)
+        if ws_unsub_request_queue is not None:
+            try:
+                ws_unsub_request_queue.put_nowait([mint])
+            except asyncio.QueueFull:
+                pass  # worst case this one slot stays occupied a bit longer
+
+
 async def _finalize_sol_pending_entry(mint: str) -> None:
     """
-    [v4.40] The one-shot, delayed entry check for a Solana pending mint.
-    Fires once, SOL_ENTRY_CHECK_DELAY seconds after creation. If this mint's
-    latest mc_sol (updated live by _handle_ws_trade while pending, if its
-    trade-feed subscription went through) now lands inside the entry window,
-    promote it to a real tracked TokenInfo -- carrying over any buy/sell
-    activity that accumulated during the wait so that data isn't lost. If
-    not, drop it for good; nothing revisits this mint again.
+    [v4.40 -> v4.46] The entry check for a Solana pending mint. First check
+    fires after SOL_ENTRY_CHECK_DELAY; if this mint's latest mc_sol (updated
+    live by _handle_ws_trade while pending, if its trade-feed subscription
+    went through) doesn't land inside the entry window yet, re-checks every
+    SOL_PENDING_RECHECK_INTERVAL instead of giving up immediately -- a real
+    launch climbing steadily shouldn't be punished for missing one arbitrary
+    instant. Keeps trying until either promoted, or SOL_PENDING_MAX_AGE is
+    reached and it's dropped for good.
     """
     await asyncio.sleep(SOL_ENTRY_CHECK_DELAY)
-    entry = _pending_sol_entries.pop(mint, None)
-    if not entry:
-        return  # already resolved another way (e.g. DexScreener path got there first)
 
-    estimated_mc = entry["mc_sol"] * WS_SOL_PRICE_USD
-    # [v4.27] vSolInBondingCurve is the SOL actually locked in the curve — the
-    # closest thing a pre-graduation token has to "liquidity". DexScreener has
-    # no pair for it at all until migration, so without this run_detections'
-    # liq_ok gate would stay permanently unsatisfiable. See run_detections.
-    estimated_liq = entry["vsol_curve"] * WS_SOL_PRICE_USD
-    th = get_thresholds("solana")
-    if not (th["mc_min"] <= estimated_mc <= th["mc_max"]):
-        return
+    while True:
+        entry = _pending_sol_entries.get(mint)
+        if not entry:
+            return  # already resolved another way (e.g. DexScreener path got there first)
 
-    async with tokens_lock:
-        if mint not in tokens and enforce_token_cap(entry["symbol"]):
-            tokens[mint] = TokenInfo(
-                mint=mint,
-                symbol=entry["symbol"],
-                name=entry["name"],
-                created_at=entry["created_at"],
-                market_cap=estimated_mc,
-                ws_discovered=True,
-                ws_initial_buy_sol=entry["initial_buy"],
-                ws_pre_enrichment=True,
-                chain_id="solana",
-                ws_liquidity_estimate=estimated_liq,
-                ws_buy_count=entry["ws_buy_count"],
-                ws_sell_count=entry["ws_sell_count"],
-                ws_buy_vol_usd=entry["ws_buy_vol_usd"],
-                ws_sell_vol_usd=entry["ws_sell_vol_usd"],
-            )
-            logger.debug(
-                f"🔬 Pre-tracked ${entry['symbol']} after {SOL_ENTRY_CHECK_DELAY:.0f}s "
-                f"grace check (MC≈${estimated_mc:,.0f})"
-            )
+        estimated_mc = entry["mc_sol"] * WS_SOL_PRICE_USD
+        # [v4.27] vSolInBondingCurve is the SOL actually locked in the curve — the
+        # closest thing a pre-graduation token has to "liquidity". DexScreener has
+        # no pair for it at all until migration, so without this run_detections'
+        # liq_ok gate would stay permanently unsatisfiable. See run_detections.
+        estimated_liq = entry["vsol_curve"] * WS_SOL_PRICE_USD
+        th = get_thresholds("solana")
+
+        if th["mc_min"] <= estimated_mc <= th["mc_max"]:
+            _pending_sol_entries.pop(mint, None)
+            async with tokens_lock:
+                if mint not in tokens and enforce_token_cap(entry["symbol"]):
+                    tokens[mint] = TokenInfo(
+                        mint=mint,
+                        symbol=entry["symbol"],
+                        name=entry["name"],
+                        created_at=entry["created_at"],
+                        market_cap=estimated_mc,
+                        ws_discovered=True,
+                        ws_initial_buy_sol=entry["initial_buy"],
+                        ws_pre_enrichment=True,
+                        chain_id="solana",
+                        ws_liquidity_estimate=estimated_liq,
+                        ws_buy_count=entry["ws_buy_count"],
+                        ws_sell_count=entry["ws_sell_count"],
+                        ws_buy_vol_usd=entry["ws_buy_vol_usd"],
+                        ws_sell_vol_usd=entry["ws_sell_vol_usd"],
+                    )
+                    waited = time.time() - entry["created_at"]
+                    logger.info(
+                        f"🔬 Pre-tracked ${entry['symbol']} after {waited:.0f}s "
+                        f"grace/recheck window (MC≈${estimated_mc:,.0f})"
+                    )
+            return  # promoted (or lost a race to another path) -- keeps its WS feed either way
+
+        age = time.time() - entry["created_at"]
+        if age >= SOL_PENDING_MAX_AGE:
+            _pending_sol_entries.pop(mint, None)
+            _release_sol_ws_subscription(mint)
+            return  # never made it into the window in time -- dropped for good
+
+        await asyncio.sleep(SOL_PENDING_RECHECK_INTERVAL)
 
 
 async def _handle_ws_trade(data: dict):
@@ -2795,6 +2875,12 @@ async def pumpfun_ws_listener():
                 await ws.send(json.dumps({"method": "subscribeNewToken"}))
                 logger.info("📡 Subscribed to new token events")
 
+                # [v4.46] A fresh connection means PumpPortal has no memory of
+                # any subscription from before -- reset the shared bookkeeping
+                # so it doesn't think slots are still occupied from a
+                # connection that no longer exists.
+                ws_subscribed_mints.clear()
+
                 # Subscribe to trades for currently tracked alerted tokens
                 alerted_mints = [
                     mint for mint, t in tokens.items()
@@ -2805,6 +2891,7 @@ async def pumpfun_ws_listener():
                         "method": "subscribeTokenTrade",
                         "keys": alerted_mints
                     }))
+                    ws_subscribed_mints.update(alerted_mints)
                     ws_stats["trade_subs"] = len(alerted_mints)
                     logger.info(f"📡 Subscribed to {len(alerted_mints)} token trade feeds")
 
@@ -2833,6 +2920,24 @@ async def pumpfun_ws_listener():
                                 except Exception:
                                     pass
 
+                        # [v4.46] drain pending trade UNsubscription requests --
+                        # frees slots on PumpPortal's side when a pending mint
+                        # ages out or a tracked-but-unalerted token is pruned,
+                        # so ws_subscribed_mints/SOL_PENDING_SUB_CAP accounting
+                        # reflects reality instead of the pool quietly clogging
+                        # with dead mints over a long uptime.
+                        if ws_unsub_request_queue is not None:
+                            while not ws_unsub_request_queue.empty():
+                                try:
+                                    unsub_keys = ws_unsub_request_queue.get_nowait()
+                                    await ws.send(json.dumps({
+                                        "method": "unsubscribeTokenTrade",
+                                        "keys": unsub_keys
+                                    }))
+                                    ws_unsub_request_queue.task_done()
+                                except Exception:
+                                    pass
+
                     except json.JSONDecodeError:
                         pass
                     except Exception as e:
@@ -2853,10 +2958,16 @@ async def pumpfun_ws_listener():
 async def ws_trade_subscription_manager():
     """
     Periodically updates the trade subscriptions as new gems are alerted.
-    Runs every 60 seconds — subscribes to newly alerted tokens.
-    """
-    subscribed: Set[str] = set()
+    Runs every 15 seconds — subscribes to newly alerted tokens.
 
+    [v4.46] Now shares ws_subscribed_mints with _handle_ws_create's pending-
+    mint requests instead of keeping its own local set -- previously the two
+    request paths had no shared view of how many of the real 50 PumpPortal
+    slots were in use, so together they could try to exceed it. Checking
+    against the same set here means alerted tokens naturally get whatever
+    pending mints aren't currently using (pending self-limits to
+    SOL_PENDING_SUB_CAP, leaving the rest of the pool free for this).
+    """
     while True:
         try:
             await asyncio.sleep(15)
@@ -2866,21 +2977,21 @@ async def ws_trade_subscription_manager():
             # Find newly alerted tokens not yet subscribed
             newly_alerted = [
                 mint for mint, t in tokens.items()
-                if t.alerted and mint not in subscribed
+                if t.alerted and mint not in ws_subscribed_mints
             ]
 
-            if newly_alerted and len(subscribed) < WS_MAX_TRADE_SUBS:
-                slots_free = WS_MAX_TRADE_SUBS - len(subscribed)
+            if newly_alerted and len(ws_subscribed_mints) < WS_MAX_TRADE_SUBS:
+                slots_free = WS_MAX_TRADE_SUBS - len(ws_subscribed_mints)
                 to_sub = newly_alerted[:slots_free]
-                subscribed.update(to_sub)
-                ws_stats["trade_subs"] = len(subscribed)
+                ws_subscribed_mints.update(to_sub)
+                ws_stats["trade_subs"] = len(ws_subscribed_mints)
                 # [fix] actually send the subscription via the request queue
                 if ws_sub_request_queue is not None:
                     try:
                         ws_sub_request_queue.put_nowait(to_sub)
                     except asyncio.QueueFull:
                         logger.warning("WS sub request queue full — skipping")
-                logger.info(f"📡 WS: subscribed to {len(to_sub)} new trade feeds | Total: {len(subscribed)}")
+                logger.info(f"📡 WS: subscribed to {len(to_sub)} new trade feeds | Total: {len(ws_subscribed_mints)}")
 
         except asyncio.CancelledError:
             break
@@ -4719,6 +4830,106 @@ a{{color:#00ccff;}}
 _WS_ENRICH_SKIP_SYMBOLS = {"SOL", "USDC", "USDT", "BTC", "ETH", "BONK", "WIF", "JUP", "RAY", "BSC", "BASE", "BNB", "WBNB", "WETH", "WBTC", "DAI", "BUSD", "CAKE", "ETHEREUM", "UNISWAP", "UNI", "LINK", "AAVE", "MKR", "COMP", "SNX"}
 
 
+def _add_pending_evm_entry(mint: str, chain_id: str, symbol: str, name: str, created_at: float, ws_discovered: bool) -> None:
+    """
+    [v4.46] Called from both EVM entry-gate rejection sites (the WS/KOL path
+    in _finalize_ws_token and the DexScreener-polling creation path below)
+    instead of just dropping a token whose first-observed MC missed the
+    window. Parks it for pending_evm_recheck_worker to keep re-checking via
+    DexScreener until it clears the window or EVM_PENDING_MAX_AGE elapses --
+    same "give a real launch more than one look" fix as Solana's
+    _pending_sol_entries, just polled instead of WS-fed since EVM pairs
+    carry no on-chain MC feed the way a bonding curve's SOL reserve does.
+    """
+    if mint in _pending_evm_entries or len(_pending_evm_entries) >= EVM_PENDING_CAP:
+        return  # already pending, or the pool is full -- drop for good rather than grow unbounded
+    _pending_evm_entries[mint] = {
+        "chain_id": chain_id,
+        "symbol": symbol,
+        "name": name,
+        "created_at": created_at,
+        "last_checked_at": 0.0,  # 0 so it's eligible for the very next recheck cycle
+        "ws_discovered": ws_discovered,
+    }
+
+
+async def pending_evm_recheck_worker(session: aiohttp.ClientSession):
+    """
+    [v4.46] Every EVM_PENDING_RECHECK_INTERVAL, re-fetches DexScreener data
+    for up to EVM_PENDING_RECHECK_BATCH pending EVM mints (oldest-checked
+    first, so a large backlog is worked through fairly rather than always
+    rechecking the same head of the dict) and promotes any that now clear
+    their chain's MC window. Both caps exist purely to bound DexScreener API
+    load -- a large backlog just means each individual mint gets rechecked
+    less often, not that the worker floods the API.
+    """
+    while True:
+        try:
+            await asyncio.sleep(EVM_PENDING_RECHECK_INTERVAL)
+            now = time.time()
+
+            # Age out anything past its window first, no API calls needed.
+            expired = [m for m, e in _pending_evm_entries.items() if now - e["created_at"] >= EVM_PENDING_MAX_AGE]
+            for m in expired:
+                _pending_evm_entries.pop(m, None)
+
+            candidates = sorted(_pending_evm_entries.items(), key=lambda kv: kv[1]["last_checked_at"])
+            candidates = candidates[:EVM_PENDING_RECHECK_BATCH]
+
+            for mint, entry in candidates:
+                if mint not in _pending_evm_entries:
+                    continue  # resolved by another path (e.g. a KOL search) while we waited
+                entry["last_checked_at"] = now
+                try:
+                    dex_data = await get_dex_data(session, mint, entry["chain_id"])
+                except Exception as e:
+                    logger.debug(f"Pending EVM recheck error [{entry['chain_id']}:{mint[:10]}...]: {e}")
+                    dex_data = None
+                await asyncio.sleep(0.2)  # same rate-limit pacing as the main polling loop
+
+                if not dex_data:
+                    continue
+                mc = dex_data.get("market_cap", 0.0)
+                th = get_thresholds(entry["chain_id"])
+                if not (th["mc_min"] <= mc <= th["mc_max"]):
+                    continue  # still outside the window -- stays pending for the next cycle
+
+                _pending_evm_entries.pop(mint, None)
+                async with tokens_lock:
+                    if mint in tokens or not enforce_token_cap(dex_data["symbol"]):
+                        continue
+                    real_launch = dex_data.get("launched_at", 0.0)
+                    tokens[mint] = TokenInfo(
+                        mint=mint,
+                        symbol=dex_data["symbol"],
+                        name=dex_data["name"],
+                        created_at=real_launch if real_launch else entry["created_at"],
+                        launched_at=real_launch,
+                        market_cap=mc,
+                        volume_usd=dex_data["volume_usd"],
+                        volume_h1_total=dex_data.get("volume_h1_total", 0.0),
+                        buy_volume_h1=dex_data.get("buy_volume_h1", 0.0),
+                        liquidity=dex_data["liquidity"],
+                        buy_ratio=dex_data.get("buy_ratio", 0.5),
+                        buys_h1=dex_data.get("buys_h1", 0),
+                        sells_h1=dex_data.get("sells_h1", 0),
+                        last_mc=mc,
+                        vol_history=[dex_data["volume_usd"]] if dex_data["volume_usd"] else [],
+                        ws_discovered=entry.get("ws_discovered", False),
+                        chain_id=entry["chain_id"],
+                    )
+                    waited = time.time() - entry["created_at"]
+                    chain_label = get_chain(entry["chain_id"])["label"]
+                    logger.info(
+                        f"🔬 Pre-tracked [{chain_label}] ${dex_data['symbol']} after "
+                        f"{waited:.0f}s recheck (MC≈${mc:,.0f})"
+                    )
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            logger.debug(f"Pending EVM recheck worker error: {e}")
+
+
 async def _finalize_ws_token(mint: str, token_data: dict, chain_id: str, dex_data: Optional[Dict], sym: str, mc: float) -> None:
     """
     Shared finalize step for a WS-discovered token — used both right after a
@@ -4763,14 +4974,25 @@ async def _finalize_ws_token(mint: str, token_data: dict, chain_id: str, dex_dat
         elif mint not in tokens:
             if not dex_data:
                 return  # never had a stub and DexScreener never resolved it — nothing to track
-            # [v4.39] Entry gate — this is this token's first real data point
-            # (no pre-track stub existed for it, e.g. a KOL-resolved mint or
-            # any EVM pair now that pre-track is off). Only start tracking it
-            # if that first real MC already sits inside this chain's entry
-            # window; otherwise, per the same "first observation only, no
-            # re-checking later" rule as above, this mint is never revisited.
+            # [v4.39 -> v4.46] Entry gate — this is this token's first real
+            # data point (no pre-track stub existed for it, e.g. a
+            # KOL-resolved mint or any EVM pair now that pre-track is off).
+            # Was strictly one-shot (miss the window here, never revisited);
+            # now an EVM miss goes to _pending_evm_entries for periodic
+            # DexScreener recheck instead of being dropped outright (Solana
+            # KOL mints still get judged once here -- they already went
+            # through Solana's own pending/recheck window earlier if they
+            # came from pump.fun at all, so a bare symbol search landing here
+            # is either an off-curve/older token DexScreener already has a
+            # stable read on, or genuinely not worth a recheck budget).
             _th = get_thresholds(final_chain)
             if not (_th["mc_min"] <= mc <= _th["mc_max"]):
+                if final_chain in ("ethereum", "bsc", "base", "robinhood"):
+                    _add_pending_evm_entry(
+                        mint, final_chain, sym, dex_data["name"],
+                        real_launch if real_launch else token_data["created_at"],
+                        ws_discovered=True,
+                    )
                 return
             if not enforce_token_cap(sym):
                 return
@@ -4951,6 +5173,9 @@ async def polling_loop():
 
         # Start WS enrichment worker using this session
         enrich_task = asyncio.create_task(ws_enrich_worker(session))
+        # [v4.46] Periodic recheck of EVM tokens that missed the entry window
+        # on first observation -- shares this session for connection reuse.
+        pending_evm_task = asyncio.create_task(pending_evm_recheck_worker(session))
 
         try:
             while True:
@@ -4994,15 +5219,23 @@ async def polling_loop():
                             if sym in SKIP_SYMBOLS or mc > 5_000_000:
                                 seen_mints.add(mint)
                                 continue
-                            # [v4.39] Was a quarter of mc_min — deliberately let a
-                            # token in below the real floor so later polls (this
-                            # loop re-fetches dex_data for already-tracked tokens
-                            # elsewhere) could catch it climbing into range. That's
-                            # exactly the "background watching" this bot no longer
-                            # does: entry is now a hard mc_min..mc_max check against
-                            # THIS first observation only — outside that window,
-                            # the mint is skipped and never revisited.
+                            # [v4.39 -> v4.46] Was a quarter of mc_min — deliberately
+                            # let a token in below the real floor so later polls
+                            # (this loop re-fetches dex_data for already-tracked
+                            # tokens elsewhere) could catch it climbing into range.
+                            # v4.39 replaced that with a hard one-shot mc_min..mc_max
+                            # check against THIS observation only. v4.46: an EVM miss
+                            # now goes to _pending_evm_entries for periodic recheck
+                            # instead of being dropped for good (Solana's fallback
+                            # path here stays one-shot -- its primary WS discovery
+                            # already has its own dedicated recheck window).
                             if not (_th["mc_min"] <= mc <= _th["mc_max"]):
+                                if chain_id_tok in ("ethereum", "bsc", "base", "robinhood"):
+                                    _add_pending_evm_entry(
+                                        mint, chain_id_tok, dex_data["symbol"], dex_data["name"],
+                                        dex_data.get("launched_at", 0.0) or time.time(),
+                                        ws_discovered=False,
+                                    )
                                 continue
 
                             async with tokens_lock:
@@ -5107,8 +5340,13 @@ async def polling_loop():
 
         finally:
             enrich_task.cancel()
+            pending_evm_task.cancel()
             try:
                 await enrich_task
+            except asyncio.CancelledError:
+                pass
+            try:
+                await pending_evm_task
             except asyncio.CancelledError:
                 pass
 
@@ -5136,8 +5374,9 @@ async def lifespan(app: FastAPI):
 
     _alert_queue = asyncio.Queue(maxsize=50)
     ws_discovery_queue = asyncio.Queue(maxsize=500)
-    global ws_sub_request_queue
+    global ws_sub_request_queue, ws_unsub_request_queue
     ws_sub_request_queue = asyncio.Queue(maxsize=100)  # [fix] trade sub requests
+    ws_unsub_request_queue = asyncio.Queue(maxsize=100)  # [v4.46] trade unsub requests
 
     load_kols()
 
