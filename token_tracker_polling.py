@@ -4042,10 +4042,17 @@ GOPLUS_CHAIN_IDS = {
     "ethereum": "1",
     "bsc": "56",
     "base": "8453",
-    # Robinhood Chain (4663) isn't indexed by GoPlus yet -- absent from this
-    # map means check_evm_token_security no-ops for it, same as any other
-    # unsupported chain or a failed/timed-out lookup (fail open: no badge,
-    # alert proceeds exactly as it would with no security data at all).
+    # [v4.48] Robinhood Chain added -- GoPlus's supported_chains endpoint now
+    # lists chain_id 4663 (confirmed live 2026-09-02; it wasn't indexed as of
+    # v4.43 when this map was first written, which silently left every RH
+    # alert completely unscreened -- no honeypot/tax/owner-risk check, and no
+    # "unscreened" badge either, so a scam RH token looked identical to a
+    # vetted one. RH had been the single largest EVM alert source in
+    # production logs, making this the biggest real gap in the security
+    # screening. A chain absent from this map still fails open exactly as
+    # before (no badge, alert proceeds with no security data) -- this only
+    # ever adds coverage, never removes it.
+    "robinhood": "4663",
 }
 SECURITY_CHECK_TIMEOUT = 5.0
 SECURITY_HIGH_TAX_PCT = float(os.getenv("SECURITY_HIGH_TAX_PCT", "25"))  # buy/sell tax %% considered a red flag
