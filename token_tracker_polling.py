@@ -3949,11 +3949,20 @@ async def check_evm_token_security(session: aiohttp.ClientSession, chain_id: str
     malformed response) -- returns checked=False and the alert proceeds
     exactly as it would with no security data, since this check only ever
     adds a warning badge and must never be able to suppress a real alert.
+
+    [v4.45] Every exit path logs its outcome at INFO (the app runs at
+    INFO level globally -- see logging.basicConfig -- so a logger.debug
+    here would silently never reach production logs at all, which is
+    exactly the gap that prompted this: with only the old "found a risk"
+    log line, "checked and clean" and "check silently failed" looked
+    identical from the outside. Now every checked EVM alert leaves a
+    trace either way.
     """
     result = SecurityResult()
+    tag = f"{chain_id}:{(token_address or '?')[:10]}..."
     goplus_chain = GOPLUS_CHAIN_IDS.get(chain_id)
     if not goplus_chain or not token_address:
-        return result
+        return result  # unsupported chain — not a failure, nothing to log
     try:
         url = f"{GOPLUS_API}/token_security/{goplus_chain}"
         async with session.get(
@@ -3962,10 +3971,16 @@ async def check_evm_token_security(session: aiohttp.ClientSession, chain_id: str
             timeout=aiohttp.ClientTimeout(total=SECURITY_CHECK_TIMEOUT),
         ) as resp:
             if resp.status != 200:
+                logger.info(f"🔒 GoPlus check failed [{tag}]: HTTP {resp.status}")
                 return result
             data = await resp.json()
             info = (data.get("result") or {}).get(token_address.lower())
-            if not info:
+            # [v4.45] `is None` (not `not info`) -- a real-but-thin GoPlus
+            # result (e.g. `{}`) is data that says "no risks known", and
+            # should log as checked/clean below, not get miscounted as a
+            # failed lookup here.
+            if info is None:
+                logger.info(f"🔒 GoPlus check failed [{tag}]: no data returned")
                 return result
 
             result.checked = True
@@ -4009,8 +4024,13 @@ async def check_evm_token_security(session: aiohttp.ClientSession, chain_id: str
             if _flag("transfer_pausable"):
                 result.risk_reasons.append("Trading pausable")
 
+            if result.has_risk:
+                logger.info(f"🔒 GoPlus check flagged [{tag}]: {', '.join(result.risk_reasons)}")
+            else:
+                logger.info(f"🔒 GoPlus check passed [{tag}]: clean")
+
     except Exception as e:
-        logger.debug(f"GoPlus security check error ({chain_id} {token_address[:10] if token_address else '?'}...): {e}")
+        logger.info(f"🔒 GoPlus check failed [{tag}]: {e}")
     return result
 
 @dataclass
@@ -4488,6 +4508,11 @@ async def run_detections(token: TokenInfo, session: aiohttp.ClientSession = None
 
             # [v4.43] EVM scam/honeypot screening (GoPlus), warn-only per user
             # choice — never blocks the alert, only adds a badge below.
+            # [v4.45] check_evm_token_security logs its own outcome (checked
+            # clean / flagged / failed) at INFO for every call — nothing
+            # duplicated here, this only needs to catch the outer timeout
+            # wrapper itself firing (the inner function has its own shorter
+            # timeout and logs that case already; this one's just a backstop).
             security = SecurityResult()
             if token.chain_id in GOPLUS_CHAIN_IDS:
                 try:
@@ -4496,9 +4521,7 @@ async def run_detections(token: TokenInfo, session: aiohttp.ClientSession = None
                         timeout=SECURITY_CHECK_TIMEOUT + 1
                     )
                 except Exception as e:
-                    logger.debug(f"Security check error for {token.mint[:10]}: {e}")
-                if security.checked and security.has_risk:
-                    logger.info(f"⚠️ Security flag [{token.symbol}]: {', '.join(security.risk_reasons)}")
+                    logger.info(f"🔒 GoPlus check failed [{token.chain_id}:{token.mint[:10]}...]: outer timeout/{e}")
 
             token.alerted = True
             token.last_alerted = now
