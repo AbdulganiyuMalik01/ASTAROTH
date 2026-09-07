@@ -65,6 +65,27 @@ CREATE TABLE IF NOT EXISTS alerts (
 );
 CREATE INDEX IF NOT EXISTS idx_alerts_chain_time ON alerts(chain_id, alerted_at);
 CREATE INDEX IF NOT EXISTS idx_alerts_symbol ON alerts(symbol);
+
+-- [v4.50] Multi-subscriber access control for the admin panel. A row here is
+-- one Telegram user who has ever messaged the bot with /start. status starts
+-- "pending" and only an admin-panel action moves it to "approved" (alerts
+-- start going to telegram_chat_id) or "revoked" (alerts stop, and stay
+-- stopped even if the same person messages /start again — see
+-- request_subscriber's explicit "don't resurrect a revoked row" behavior).
+-- The bot owner's own TELEGRAM_CHAT_ID never goes through this table at all
+-- (checked separately, see ADMIN_CHAT_ID in token_tracker_polling.py) — this
+-- is only for everyone else.
+CREATE TABLE IF NOT EXISTS subscribers (
+    id                INTEGER PRIMARY KEY AUTOINCREMENT,
+    telegram_user_id  TEXT NOT NULL UNIQUE,
+    telegram_chat_id  TEXT NOT NULL,
+    username          TEXT,
+    first_name        TEXT,
+    status            TEXT NOT NULL DEFAULT 'pending',  -- pending | approved | revoked
+    requested_at      REAL NOT NULL,
+    decided_at        REAL
+);
+CREATE INDEX IF NOT EXISTS idx_subscribers_status ON subscribers(status);
 """
 
 
@@ -189,3 +210,185 @@ async def get_stats_async() -> Dict:
     except Exception as e:
         logger.debug(f"Alert history stats failed: {e}")
         return {"total": 0, "by_chain": {}, "by_reason": {}, "enabled": False}
+
+
+# ============================================================================
+# [v4.50] Subscriber access control (admin-approved alert fan-out)
+# ============================================================================
+
+def _request_subscriber(user_id: str, chat_id: str, username: str, first_name: str) -> str:
+    """
+    Registers (or looks up) a /start request. Returns one of:
+      "new_pending"       — first time seeing this user, row created as pending
+      "already_pending"   — they already have an open request
+      "already_approved"  — they're already an approved subscriber
+      "already_revoked"   — an admin previously revoked them; does NOT
+                             resurrect the row to pending (a revoked user
+                             re-messaging /start should not silently get a
+                             second chance at approval without the admin
+                             deciding again on purpose via the panel)
+    Never raises -- caller treats any DB failure as "new_pending" being
+    unavailable and should fail safe (not send alerts).
+    """
+    conn = sqlite3.connect(_db_path, timeout=5)
+    conn.row_factory = sqlite3.Row
+    try:
+        row = conn.execute(
+            "SELECT status FROM subscribers WHERE telegram_user_id = ?", (user_id,)
+        ).fetchone()
+        if row:
+            # Keep contact info fresh (username/chat_id can change) without
+            # touching status.
+            conn.execute(
+                "UPDATE subscribers SET telegram_chat_id = ?, username = ?, first_name = ? "
+                "WHERE telegram_user_id = ?",
+                (chat_id, username, first_name, user_id),
+            )
+            conn.commit()
+            return f"already_{row['status']}"
+        conn.execute(
+            "INSERT INTO subscribers (telegram_user_id, telegram_chat_id, username, "
+            "first_name, status, requested_at) VALUES (?, ?, ?, ?, 'pending', ?)",
+            (user_id, chat_id, username, first_name, time.time()),
+        )
+        conn.commit()
+        return "new_pending"
+    finally:
+        conn.close()
+
+
+async def request_subscriber_async(user_id: str, chat_id: str, username: str, first_name: str) -> str:
+    if not _enabled:
+        return "unavailable"
+    try:
+        return await asyncio.to_thread(_request_subscriber, user_id, chat_id, username, first_name)
+    except Exception as e:
+        logger.warning(f"Subscriber request failed: {e}")
+        return "unavailable"
+
+
+def _is_approved(user_id: str) -> bool:
+    conn = sqlite3.connect(_db_path, timeout=5)
+    try:
+        row = conn.execute(
+            "SELECT 1 FROM subscribers WHERE telegram_user_id = ? AND status = 'approved'", (user_id,)
+        ).fetchone()
+        return row is not None
+    finally:
+        conn.close()
+
+
+async def is_approved_async(user_id: str) -> bool:
+    """Used to gate read-only bot commands (/status, /tokens, /gems, etc.) to
+    admin + approved subscribers only -- fails CLOSED (returns False) on any
+    DB error, since the safe default for an access check is to deny, not
+    silently let an unapproved user through."""
+    if not _enabled or not user_id:
+        return False
+    try:
+        return await asyncio.to_thread(_is_approved, user_id)
+    except Exception as e:
+        logger.debug(f"Approval check failed: {e}")
+        return False
+
+
+def _list_subscribers(status: Optional[str]) -> List[Dict]:
+    conn = sqlite3.connect(_db_path, timeout=5)
+    conn.row_factory = sqlite3.Row
+    try:
+        if status:
+            cur = conn.execute(
+                "SELECT * FROM subscribers WHERE status = ? ORDER BY requested_at DESC", (status,)
+            )
+        else:
+            cur = conn.execute("SELECT * FROM subscribers ORDER BY requested_at DESC")
+        return [dict(r) for r in cur.fetchall()]
+    finally:
+        conn.close()
+
+
+async def list_subscribers_async(status: Optional[str] = None) -> List[Dict]:
+    if not _enabled:
+        return []
+    try:
+        return await asyncio.to_thread(_list_subscribers, status)
+    except Exception as e:
+        logger.warning(f"Subscriber list failed: {e}")
+        return []
+
+
+def _list_approved_chat_ids() -> List[str]:
+    conn = sqlite3.connect(_db_path, timeout=5)
+    try:
+        cur = conn.execute("SELECT telegram_chat_id FROM subscribers WHERE status = 'approved'")
+        return [r[0] for r in cur.fetchall()]
+    finally:
+        conn.close()
+
+
+async def list_approved_chat_ids_async() -> List[str]:
+    """Used on every alert fire (fan-out) -- must never raise or block on a
+    disk hiccup, and fails to an empty list (no fan-out, admin still gets
+    the alert through the normal unconditional path) rather than crashing
+    the alert pipeline."""
+    if not _enabled:
+        return []
+    try:
+        return await asyncio.to_thread(_list_approved_chat_ids)
+    except Exception as e:
+        logger.debug(f"Approved-subscriber list failed: {e}")
+        return []
+
+
+def _set_subscriber_status(sub_id: int, status: str) -> Optional[Dict]:
+    conn = sqlite3.connect(_db_path, timeout=5)
+    conn.row_factory = sqlite3.Row
+    try:
+        conn.execute(
+            "UPDATE subscribers SET status = ?, decided_at = ? WHERE id = ?",
+            (status, time.time(), sub_id),
+        )
+        conn.commit()
+        row = conn.execute("SELECT * FROM subscribers WHERE id = ?", (sub_id,)).fetchone()
+        return dict(row) if row else None
+    finally:
+        conn.close()
+
+
+async def approve_subscriber_async(sub_id: int) -> Optional[Dict]:
+    if not _enabled:
+        return None
+    try:
+        return await asyncio.to_thread(_set_subscriber_status, sub_id, "approved")
+    except Exception as e:
+        logger.warning(f"Subscriber approve failed: {e}")
+        return None
+
+
+async def revoke_subscriber_async(sub_id: int) -> Optional[Dict]:
+    if not _enabled:
+        return None
+    try:
+        return await asyncio.to_thread(_set_subscriber_status, sub_id, "revoked")
+    except Exception as e:
+        logger.warning(f"Subscriber revoke failed: {e}")
+        return None
+
+
+def _count_subscribers() -> Dict[str, int]:
+    conn = sqlite3.connect(_db_path, timeout=5)
+    try:
+        rows = conn.execute("SELECT status, COUNT(*) FROM subscribers GROUP BY status").fetchall()
+        return {status: n for status, n in rows}
+    finally:
+        conn.close()
+
+
+async def count_subscribers_async() -> Dict[str, int]:
+    if not _enabled:
+        return {}
+    try:
+        return await asyncio.to_thread(_count_subscribers)
+    except Exception as e:
+        logger.debug(f"Subscriber count failed: {e}")
+        return {}

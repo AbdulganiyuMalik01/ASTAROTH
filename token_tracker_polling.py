@@ -46,6 +46,9 @@ import html
 import time
 import logging
 import re
+import secrets
+import hmac
+import hashlib
 from collections import defaultdict, deque
 from dataclasses import dataclass, field
 from typing import Dict, Optional, Set, List
@@ -54,8 +57,8 @@ from contextlib import asynccontextmanager
 import aiohttp
 import websockets
 from dotenv import load_dotenv
-from fastapi import FastAPI, Request
-from fastapi.responses import JSONResponse, HTMLResponse
+from fastapi import FastAPI, Request, Form, Cookie
+from fastapi.responses import JSONResponse, HTMLResponse, RedirectResponse
 import uvicorn
 
 from telegram import Bot, BotCommand
@@ -93,6 +96,23 @@ config = get_config()
 TELEGRAM_BOT_TOKEN = config.telegram.bot_token
 TELEGRAM_CHAT_ID = config.telegram.chat_id
 TELEGRAM_ENABLED = TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID
+# [v4.50] TELEGRAM_CHAT_ID is treated as the bot owner's own chat -- it always
+# gets every alert unconditionally (unchanged from before this version) and
+# never goes through the subscribers table/admin-approval flow at all. String
+# comparison because Telegram chat ids arrive from the webhook as JSON
+# numbers but TELEGRAM_CHAT_ID is an env-var string.
+ADMIN_CHAT_ID = str(TELEGRAM_CHAT_ID).strip()
+# Admin panel (/admin) login. Unset by default -- the panel refuses ALL
+# access (not "falls open") until this is set, since an open admin panel
+# would let anyone approve themselves into the alert feed. Session cookie is
+# HMAC-signed with ADMIN_SESSION_SECRET; if that's left unset a random
+# secret is generated at process start, which is fine functionally (login
+# still works) but means every restart invalidates existing sessions --
+# acceptable for a low-traffic single-admin panel, but set it explicitly on
+# Railway if that's annoying.
+ADMIN_PASSWORD = os.getenv("ADMIN_PASSWORD", "").strip()
+ADMIN_SESSION_SECRET = os.getenv("ADMIN_SESSION_SECRET", "").strip() or secrets.token_hex(32)
+ADMIN_SESSION_MAX_AGE = 7 * 24 * 3600  # 7 days
 HELIUS_API_KEY = config.api.helius_api_key
 HELIUS_RPC = f"https://mainnet.helius-rpc.com/?api-key={HELIUS_API_KEY}" if HELIUS_API_KEY else ""
 
@@ -1510,12 +1530,20 @@ async def alert_worker():
             await asyncio.sleep(5)
 
 
-async def _send_telegram_direct(text: str, parse_mode: str = "HTML", reply_to_message_id: int = 0) -> int:
-    """Send a Telegram message. Returns message_id (0 on failure)."""
+async def _send_telegram_direct(text: str, parse_mode: str = "HTML", reply_to_message_id: int = 0,
+                                 chat_id=None) -> int:
+    """Send a Telegram message. Returns message_id (0 on failure).
+
+    [v4.50] `chat_id` defaults to the admin's own TELEGRAM_CHAT_ID (unchanged
+    behavior for every pre-existing call site) but can be overridden -- used
+    both for replying to whichever chat actually sent a command (see
+    handle_telegram_command) and for fanning an alert out to approved
+    subscribers (see _fanout_alert_to_subscribers)."""
     if not TELEGRAM_ENABLED or not telegram_bot:
         return 0
     try:
-        kwargs = dict(chat_id=TELEGRAM_CHAT_ID, text=text, parse_mode=parse_mode)
+        kwargs = dict(chat_id=chat_id if chat_id is not None else TELEGRAM_CHAT_ID,
+                       text=text, parse_mode=parse_mode)
         if reply_to_message_id:
             kwargs["reply_to_message_id"] = reply_to_message_id
         msg = await telegram_bot.send_message(**kwargs)
@@ -1538,6 +1566,7 @@ async def init_telegram():
         me = await telegram_bot.get_me()
         logger.info(f"✅ Telegram bot: {me.username}")
         commands = [
+            BotCommand("start", "Request alert access"),
             BotCommand("status", "Bot status"),
             BotCommand("tokens", "All tracked tokens"),
             BotCommand("gems", "Alerted gems sorted by MC"),
@@ -1545,6 +1574,7 @@ async def init_telegram():
             BotCommand("kols", "KOL account list"),
             BotCommand("addkol", "Add KOL to monitor"),
             BotCommand("removekol", "Remove a KOL"),
+            BotCommand("myaccess", "Check your alert-access status"),
             BotCommand("help", "Help"),
         ]
         await telegram_bot.set_my_commands(commands)
@@ -1553,7 +1583,10 @@ async def init_telegram():
 
 
 async def send_telegram(text: str, parse_mode: str = "HTML") -> int:
-    """Queue alert (rate-limited). Returns message_id when sent directly, 0 when queued."""
+    """Queue alert (rate-limited). Returns message_id when sent directly, 0 when queued.
+    Always the admin's chat — the rate-limited queue is a single FIFO shared
+    with the admin's own feed, so this was never a fit for per-subscriber
+    fan-out (see _fanout_alert_to_subscribers, which sends directly instead)."""
     if not TELEGRAM_ENABLED or not telegram_bot:
         return 0
     if _alert_queue is not None:
@@ -1562,9 +1595,12 @@ async def send_telegram(text: str, parse_mode: str = "HTML") -> int:
     return await _send_telegram_direct(text, parse_mode)
 
 
-async def send_telegram_now(text: str, parse_mode: str = "HTML") -> int:
-    """Bypass rate limiter — for commands only. Returns message_id."""
-    return await _send_telegram_direct(text, parse_mode)
+async def send_telegram_now(text: str, parse_mode: str = "HTML", chat_id=None) -> int:
+    """Bypass rate limiter — for commands only. Returns message_id.
+    [v4.50] `chat_id` defaults to the admin's chat (unchanged for every
+    existing call site); handle_telegram_command passes the actual sender's
+    chat_id so a non-admin's command reply goes back to THEM, not the admin."""
+    return await _send_telegram_direct(text, parse_mode, chat_id=chat_id)
 
 
 async def send_telegram_reply(text: str, reply_to_message_id: int, parse_mode: str = "HTML") -> int:
@@ -1574,8 +1610,86 @@ async def send_telegram_reply(text: str, reply_to_message_id: int, parse_mode: s
     return await _send_telegram_direct(text, parse_mode, reply_to_message_id=reply_to_message_id)
 
 
-async def handle_telegram_command(text: str):
+async def _fanout_alert_to_subscribers(text: str) -> None:
+    """
+    [v4.50] Sends an already-formatted gem alert to every admin-approved
+    subscriber, in addition to the admin's own unconditional copy (sent
+    separately, at the call site, exactly as before this version existed).
+
+    Deliberately fire-and-forget from the caller's perspective (wrap in
+    asyncio.create_task) -- a slow or failing fan-out must never delay the
+    admin's own alert, which is the one thing this bot absolutely cannot be
+    late on. Sent sequentially with a small stagger rather than
+    asyncio.gather'd all at once: Telegram's bot API rate limit is roughly
+    30 messages/sec *across all chats*, and at any subscriber count this
+    codebase is realistically going to see, a small per-message delay costs
+    nothing that matters while a burst large enough to hit that limit gets
+    some messages silently dropped (python-telegram-bot doesn't auto-retry
+    429s inside a fire-and-forget task here).
+    """
+    if not TELEGRAM_ENABLED or not telegram_bot:
+        return
+    try:
+        chat_ids = await alert_db.list_approved_chat_ids_async()
+    except Exception as e:
+        logger.debug(f"Subscriber fan-out lookup failed: {e}")
+        return
+    for cid in chat_ids:
+        if str(cid) == ADMIN_CHAT_ID:
+            continue  # never double-send if the admin somehow also has a subscriber row
+        try:
+            await _send_telegram_direct(text, chat_id=cid)
+        except Exception as e:
+            logger.debug(f"Subscriber fan-out send failed [{cid}]: {e}")
+        await asyncio.sleep(0.05)
+
+
+HELP_TEXT = (
+    "🤖 <b>ASTAROTH v4.11 Commands</b>\n\n"
+    "/status — bot health + WS stats\n"
+    "/gems — alerted gems sorted by MC\n"
+    "/hot — high velocity tokens\n"
+    "/tokens — full tracked list\n"
+    "/kols — KOL account list\n"
+    "/addkol @handle — add a KOL to monitor\n"
+    "/removekol @handle — remove a KOL\n"
+    "/myaccess — check your alert-access status\n"
+    "/help — this message\n\n"
+    "⚡ = discovered via WebSocket\n"
+    "💎 = gem alert fired\n"
+    "🔥 = high MC velocity\n"
+    "👁 = KOL mention alert"
+)
+
+
+async def handle_telegram_command(text: str, chat_id=None, user: Optional[dict] = None):
+    """
+    [v4.50] `chat_id`/`user` identify who actually sent this command over
+    the Telegram webhook -- previously discarded entirely, which meant
+    every reply (including /help to a total stranger) went to the admin's
+    own chat instead of back to whoever sent the command. `reply()` below
+    fixes that for every command uniformly; `is_admin` gates the handful
+    of owner-only side effects (auto-approval, admin-notify) without
+    touching every individual branch's message text.
+    """
+    async def reply(msg: str) -> int:
+        return await send_telegram_now(msg, chat_id=chat_id)
+
+    is_admin = chat_id is None or str(chat_id) == ADMIN_CHAT_ID
     cmd = text.split()[0].lower().replace("/", "").split("@")[0]
+
+    # [v4.50] Gate read-only/mutating bot commands to admin + approved
+    # subscribers -- without this, an unapproved stranger could still see
+    # every tracked token via /tokens or /gems (or even mutate the admin's
+    # KOL watchlist via /addkol) without ever being granted access, which
+    # would make the whole admin-approval gate meaningless. /start, /myaccess
+    # and /help stay open to everyone -- those are how you GET access.
+    RESTRICTED_COMMANDS = {"status", "tokens", "gems", "hot", "kols", "addkol", "removekol"}
+    if cmd in RESTRICTED_COMMANDS and not is_admin:
+        uid = str((user or {}).get("id", chat_id))
+        if not await alert_db.is_approved_async(uid):
+            await reply("🔒 That command needs approved access. Send /start to request it, or /myaccess to check your status.")
+            return
 
     if cmd == "status":
         hot_count = sum(1 for t in tokens.values() if is_high_velocity(t))
@@ -1583,7 +1697,7 @@ async def handle_telegram_command(text: str):
         gem_count = sum(1 for t in tokens.values() if t.alerted)
         ws_disc = sum(1 for t in tokens.values() if t.ws_discovered)
         ws_age = int(time.time() - ws_stats["last_message_at"]) if ws_stats["last_message_at"] else -1
-        await send_telegram_now(
+        await reply(
             f"✅ <b>ASTAROTH v4.11 Status</b>\n\n"
             f"📊 Tracking: {len(tokens)} / {MAX_TRACKED_TOKENS}\n"
             f"💎 Gems alerted: {gem_count}\n"
@@ -1606,7 +1720,7 @@ async def handle_telegram_command(text: str):
     elif cmd == "gems":
         alerted = [(mint, t) for mint, t in tokens.items() if t.alerted]
         if not alerted:
-            await send_telegram_now("💎 No gems alerted yet.")
+            await reply("💎 No gems alerted yet.")
             return
         alerted.sort(key=lambda x: x[1].market_cap, reverse=True)
         lines = []
@@ -1621,7 +1735,7 @@ async def handle_telegram_command(text: str):
                 f"<b>${t.symbol}</b>{mult} {tag_str} | MC: ${t.market_cap:,.0f}\n"
                 f"<code>{mint}</code>"
             )
-        await send_telegram_now(
+        await reply(
             f"💎 <b>Alerted Gems ({len(alerted)}) — by MC</b>\n\n" +
             "\n\n".join(lines)
         )
@@ -1629,7 +1743,7 @@ async def handle_telegram_command(text: str):
     elif cmd == "hot":
         hot = [(m, t) for m, t in tokens.items() if is_high_velocity(t) or is_vol_accelerating(t)]
         if not hot:
-            await send_telegram_now("🔥 No hot tokens right now.")
+            await reply("🔥 No hot tokens right now.")
             return
         hot.sort(key=lambda x: x[1].mc_velocity, reverse=True)
         lines = []
@@ -1643,13 +1757,13 @@ async def handle_telegram_command(text: str):
                 f"<b>${t.symbol}</b> [{', '.join(tags)}] | MC: ${t.market_cap:,.0f}\n"
                 f"<code>{mint}</code>"
             )
-        await send_telegram_now(
+        await reply(
             f"🔥 <b>Hot Tokens ({len(hot)})</b>\n\n" + "\n\n".join(lines)
         )
 
     elif cmd == "tokens":
         if not tokens:
-            await send_telegram_now("📭 No tokens tracked yet.")
+            await reply("📭 No tokens tracked yet.")
             return
         token_list = sorted(tokens.items(), key=lambda x: x[1].market_cap, reverse=True)
         total = len(token_list)
@@ -1665,18 +1779,18 @@ async def handle_telegram_command(text: str):
                     f"<b>${t.symbol}</b>{gem_str}{ws_str}{vel_str} | MC: ${t.market_cap:,.0f}\n"
                     f"<code>{mint}</code>"
                 )
-            await send_telegram_now(header + "\n\n".join(lines))
+            await reply(header + "\n\n".join(lines))
 
     elif cmd == "addkol":
         parts = text.strip().split()
         if len(parts) < 2:
-            await send_telegram_now("Usage: /addkol @handle")
+            await reply("Usage: /addkol @handle")
             return
         handle = parts[1].lstrip("@").lower()
         if handle in kol_accounts:
-            await send_telegram_now(f"📋 @{handle} is already in your KOL list.")
+            await reply(f"📋 @{handle} is already in your KOL list.")
         elif len(kol_accounts) >= KOL_MAX_ACCOUNTS:
-            await send_telegram_now(f"⚠️ KOL list is full ({KOL_MAX_ACCOUNTS} max). Remove one first.")
+            await reply(f"⚠️ KOL list is full ({KOL_MAX_ACCOUNTS} max). Remove one first.")
         else:
             kol_accounts[handle] = {
                 "added_at": time.time(),
@@ -1684,7 +1798,7 @@ async def handle_telegram_command(text: str):
                 "post_ids_seen": [],
             }
             save_kols()
-            await send_telegram_now(
+            await reply(
                 f"✅ Added @{handle} to KOL list\n"
                 f"📋 Total KOLs: {len(kol_accounts)}"
             )
@@ -1693,15 +1807,15 @@ async def handle_telegram_command(text: str):
     elif cmd == "removekol":
         parts = text.strip().split()
         if len(parts) < 2:
-            await send_telegram_now("Usage: /removekol @handle")
+            await reply("Usage: /removekol @handle")
             return
         handle = parts[1].lstrip("@").lower()
         if handle not in kol_accounts:
-            await send_telegram_now(f"📋 @{handle} is not in your KOL list.")
+            await reply(f"📋 @{handle} is not in your KOL list.")
         else:
             del kol_accounts[handle]
             save_kols()
-            await send_telegram_now(
+            await reply(
                 f"🗑️ Removed @{handle} from KOL list\n"
                 f"📋 Total KOLs: {len(kol_accounts)}"
             )
@@ -1709,7 +1823,7 @@ async def handle_telegram_command(text: str):
 
     elif cmd == "kols":
         if not kol_accounts:
-            await send_telegram_now(
+            await reply(
                 "📋 <b>KOL List</b>\n\n"
                 "No KOLs added yet.\n"
                 "Use /addkol @handle to add one."
@@ -1722,28 +1836,66 @@ async def handle_telegram_command(text: str):
                 age = int(now - last) if last else -1
                 age_str = f"{age}s ago" if age >= 0 else "never"
                 lines.append(f"• @{handle} — last polled: {age_str}")
-            await send_telegram_now(
+            await reply(
                 f"📋 <b>KOL List ({len(kol_accounts)})</b>\n\n" +
                 "\n".join(lines) +
                 "\n\n<i>Use /addkol @handle or /removekol @handle</i>"
             )
 
-    elif cmd in ("help", "start"):
-        await send_telegram_now(
-            "🤖 <b>ASTAROTH v4.11 Commands</b>\n\n"
-            "/status — bot health + WS stats\n"
-            "/gems — alerted gems sorted by MC\n"
-            "/hot — high velocity tokens\n"
-            "/tokens — full tracked list\n"
-            "/kols — KOL account list\n"
-            "/addkol @handle — add a KOL to monitor\n"
-            "/removekol @handle — remove a KOL\n"
-            "/help — this message\n\n"
-            "⚡ = discovered via WebSocket\n"
-            "💎 = gem alert fired\n"
-            "🔥 = high MC velocity\n"
-            "👁️ = KOL mention alert"
-        )
+    elif cmd == "start":
+        # [v4.50] The admin's own /start is identical to /help (unchanged
+        # behavior). Anyone else triggers the access-request flow: register
+        # (or look up) them in the subscribers table and tell them plainly
+        # where things stand, without ever revealing tracked-token data to
+        # an unapproved chat.
+        if is_admin:
+            await reply(HELP_TEXT)
+            return
+        uid = str((user or {}).get("id", chat_id))
+        uname = (user or {}).get("username") or ""
+        fname = (user or {}).get("first_name") or ""
+        result = await alert_db.request_subscriber_async(uid, str(chat_id), uname, fname)
+        if result == "new_pending":
+            await reply(
+                "👋 <b>Access request sent.</b>\n\n"
+                "ASTAROTH's live gem alerts are admin-approved. Your request "
+                "has been logged — you'll get a message here the moment "
+                "you're approved. Check /myaccess any time."
+            )
+            who = f"@{uname}" if uname else (fname or uid)
+            await send_telegram_now(
+                f"🔔 <b>New access request</b>\n{who} (id {uid}) wants alert access.\n"
+                "Review it in the admin panel (/admin) to approve or deny.",
+                chat_id=ADMIN_CHAT_ID,
+            )
+        elif result == "already_pending":
+            await reply("⏳ Your access request is still pending admin review. Check back soon, or use /myaccess.")
+        elif result == "already_approved":
+            await reply("✅ You're already approved — alerts are being sent to this chat.")
+        elif result == "already_revoked":
+            await reply("🚫 Your access was revoked by an admin. Contact them directly if you believe this is a mistake.")
+        else:
+            await reply("⚠️ Couldn't process your request right now (storage unavailable) — try again shortly.")
+
+    elif cmd == "myaccess":
+        if is_admin:
+            await reply("✅ You're the admin — you always receive every alert.")
+        else:
+            uid = str((user or {}).get("id", chat_id))
+            subs = await alert_db.list_subscribers_async()
+            mine = next((s for s in subs if s["telegram_user_id"] == uid), None)
+            if not mine:
+                await reply("You haven't requested access yet — send /start to request it.")
+            else:
+                status_msg = {
+                    "pending": "⏳ Pending admin review.",
+                    "approved": "✅ Approved — you're receiving alerts.",
+                    "revoked": "🚫 Revoked.",
+                }.get(mine["status"], mine["status"])
+                await reply(f"Your access status: {status_msg}")
+
+    elif cmd == "help":
+        await reply(HELP_TEXT)
     else:
         logger.debug(f"Unknown command: {cmd}")
 
@@ -4105,44 +4257,106 @@ def format_gem_alert(token: TokenInfo, alert_reason: str = "GEM", distro: "Distr
     if token.price_change_h1 and abs(token.price_change_h1) > 1:
         arrow = "▲" if token.price_change_h1 > 0 else "▼"
         badges.append(f"{'🟢' if token.price_change_h1 > 0 else '🔴'} {token.price_change_h1:+.0f}% {arrow}")
-    if distro and distro.data_available: badges.append(format_distro_line(distro))
+    # [v4.50] format_distro_line's content now has its own guaranteed line
+    # below (holder_line) instead of competing for a spot in badges[:4] —
+    # see that block for why. Not appended here anymore to avoid showing the
+    # same Top1/Top10 numbers twice.
 
-    # Chain-specific links
+    # [v4.50] Chain-specific links, redesigned: previously this whole
+    # multi-link row sat at the very bottom, and Telegram's own automatic
+    # link-preview locks onto whichever URL appears FIRST in the raw message
+    # text (whatever that happened to be), not necessarily the most useful
+    # one. Now split into a `primary_link` (the chart/curve page — this
+    # becomes the embedded, clickable $SYMBOL itself, two lines up, so it's
+    # both the first URL in the message AND the one Telegram's preview picks
+    # up) and a single `secondary_link` (the block explorer, kept at the
+    # bottom next to the copyable contract address).
     if alert_reason == "CURVE🌊":
         # Pre-migration four.meme token — no DexScreener pair exists yet,
         # a dexscreener.com link here would just 404.
-        links = f"<a href='https://four.meme/token/{token.mint}'>four.meme</a> · <a href='https://bscscan.com/token/{token.mint}'>Scan</a>"
+        primary_link, secondary_label, secondary_link = (
+            f"https://four.meme/token/{token.mint}", "Scan", f"https://bscscan.com/token/{token.mint}"
+        )
     elif alert_reason == "CURVE🚩":
         # Pre-migration Flap token — same reasoning as four.meme above, no
         # DexScreener pair exists yet. URL pattern (flap.sh/token/<address>)
         # is a best guess, NOT independently verified against a live token
         # page from this environment — cosmetic link only, worst case a 404,
         # no effect on detection/alerting (same caveat as the Robinhood Chain
-        # explorer link elsewhere in this function).
-        links = f"<a href='https://flap.sh/token/{token.mint}'>Flap</a> · <a href='https://bscscan.com/token/{token.mint}'>Scan</a>"
+        # explorer link below).
+        primary_link, secondary_label, secondary_link = (
+            f"https://flap.sh/token/{token.mint}", "Scan", f"https://bscscan.com/token/{token.mint}"
+        )
     elif token.chain_id == "solana":
-        links = f"<a href='{_dex_url}'>DEX</a> · <a href='https://pump.fun/{token.mint}'>Pump</a>"
+        primary_link, secondary_label, secondary_link = (
+            _dex_url, "Pump", f"https://pump.fun/{token.mint}"
+        )
     elif token.chain_id == "bsc":
-        links = f"<a href='{_dex_url}'>DEX</a> · <a href='https://dextools.io/app/en/bnb/pair-explorer/{token.mint}'>Tools</a>"
+        primary_link, secondary_label, secondary_link = (
+            _dex_url, "Tools", f"https://dextools.io/app/en/bnb/pair-explorer/{token.mint}"
+        )
     elif token.chain_id == "base":
-        links = f"<a href='{_dex_url}'>DEX</a> · <a href='https://basescan.org/token/{token.mint}'>Scan</a>"
+        primary_link, secondary_label, secondary_link = (
+            _dex_url, "Scan", f"https://basescan.org/token/{token.mint}"
+        )
     elif token.chain_id == "ethereum":
-        links = f"<a href='{_dex_url}'>DEX</a> · <a href='https://etherscan.io/token/{token.mint}'>Scan</a>"
+        primary_link, secondary_label, secondary_link = (
+            _dex_url, "Scan", f"https://etherscan.io/token/{token.mint}"
+        )
     elif token.chain_id == "robinhood":
         # [v4.37] hoodexplorer.org — Blockscout-style explorer for Robinhood
         # Chain. URL pattern not independently verified against a live page
         # (fetch blocked by its robots.txt from this environment); cosmetic
         # link only, worst case a 404, no effect on detection/alerting.
-        links = f"<a href='{_dex_url}'>DEX</a> · <a href='https://www.hoodexplorer.org/token/{token.mint}'>Scan</a>"
+        primary_link, secondary_label, secondary_link = (
+            _dex_url, "Scan", f"https://www.hoodexplorer.org/token/{token.mint}"
+        )
     else:
-        links = f"<a href='{_dex_url}'>DEX</a>"
+        primary_link, secondary_label, secondary_link = (_dex_url, "", "")
 
+    # [v4.50] Dedicated, guaranteed holder-stats line — previously the
+    # Solana-only version of this (format_distro_line) was just one more
+    # candidate fighting for a spot in the badges[:4] cap below, appended
+    # LAST, so it was the badge most likely to get silently dropped when 4+
+    # other badges applied. EVM chains had no holder data shown anywhere at
+    # all. Now both chain families get their own line, unconditionally shown
+    # whenever real holder data is available, using whichever source this
+    # chain actually has: Solana's Helius-based DistroResult, or the
+    # holder_count/top1_holder_pct GoPlus already returned alongside the
+    # security check for EVM chains (see check_evm_token_security -- zero
+    # extra API calls).
+    holder_line = ""
+    if token.chain_id == "solana" and distro and distro.data_available:
+        risk = "🟢" if distro.top10_pct < 40 else "🟡" if distro.top10_pct < 55 else "🔴"
+        holder_line = (
+            f"👥 <b>Holders:</b> {distro.holder_count} · "
+            f"Top1 {distro.top1_pct:.0f}% · Top10 {distro.top10_pct:.0f}% {risk}"
+        )
+    elif (token.chain_id in ("ethereum", "bsc", "base", "robinhood")
+            and security and security.checked and security.holder_count > 0):
+        # Risk coloring here is softer than Solana's (only flags red past
+        # 60%) since the top-holder exclusion heuristic in
+        # check_evm_token_security is best-effort, not guaranteed to catch
+        # every DEX pool address — see that function's comment.
+        risk = "🟢" if security.top1_holder_pct < 25 else "🟡" if security.top1_holder_pct < 60 else "🔴"
+        owner_part = f" · Owner {security.owner_percent:.0f}%" if security.owner_percent >= 1 else ""
+        holder_line = (
+            f"👥 <b>Holders:</b> {security.holder_count} · "
+            f"Top1 {security.top1_holder_pct:.0f}%{owner_part} {risk}"
+        )
+
+    symbol_line = (
+        f"<a href='{primary_link}'><b>${safe_symbol}</b></a>  <i>{safe_name}</i>"
+        if primary_link else f"<b>${safe_symbol}</b>  <i>{safe_name}</i>"
+    )
     lines = [
         f"{signal_label}  {chain['emoji']} <b>{chain['label']}</b>",
-        f"<b>${safe_symbol}</b>  <i>{safe_name}</i>",
+        symbol_line,
         f"MC <b>{mc_s}</b>  Vol <b>{vol_s}</b>  Liq <b>{liq_s}</b>  Age <b>{age_str}</b>",
         f"[{bp_bar}] {buy_pct}%  {txn_str}",
     ]
+    if holder_line:
+        lines.append(holder_line)
     if badges:
         lines.append("  ".join(badges[:4]))
     # [v4.43] GoPlus security warning — always shown in full (not subject to
@@ -4150,10 +4364,9 @@ def format_gem_alert(token: TokenInfo, alert_reason: str = "GEM", distro: "Distr
     # actually sees it, not that it gets silently crowded out.
     if security and security.checked and security.has_risk:
         lines.append("⚠️ <b>Security:</b> " + " · ".join(security.risk_reasons[:4]))
-    lines += [
-        f"<code>{token.mint}</code>",
-        links,
-    ]
+    lines.append(f"<code>{token.mint}</code>")
+    if secondary_link:
+        lines.append(f"<a href='{secondary_link}'>{secondary_label}</a>")
     return "\n".join(lines)
 
 
@@ -4316,6 +4529,13 @@ class SecurityResult:
     high_tax: bool = False
     owner_risk: bool = False
     risk_reasons: List[str] = field(default_factory=list)
+    # [v4.50] Holder stats -- free byproduct of the same GoPlus call already
+    # being made for security screening, no extra API request. Gives EVM
+    # chains a rough equivalent of Solana's Helius-based DistroResult
+    # (holder_count/top1_pct) for the redesigned alert card's Holders line.
+    holder_count: int = 0
+    top1_holder_pct: float = 0.0   # largest non-burn holder's % of supply
+    owner_percent: float = 0.0     # % of supply held by the contract owner
 
     @property
     def has_risk(self) -> bool:
@@ -4404,6 +4624,38 @@ async def check_evm_token_security(session: aiohttp.ClientSession, chain_id: str
                 result.risk_reasons.append("Selfdestruct function")
             if _flag("transfer_pausable"):
                 result.risk_reasons.append("Trading pausable")
+
+            # [v4.50] Holder stats -- same response, no extra call. holders
+            # is documented as sorted by balance descending, but that's not
+            # verified from this sandbox, so top1_holder_pct takes the max
+            # explicitly rather than trusting holders[0]. Excludes anything
+            # whose GoPlus `tag` looks like a burn address OR a DEX/LP pool
+            # (pool/lp/router/pancake/uniswap/swap) -- a token's own trading
+            # pool legitimately holding a large share of supply pre-migration
+            # is normal and would otherwise read as a false "top holder
+            # controls 80%" rug-risk alarm. This is a best-effort substring
+            # match on whatever tag text GoPlus happens to supply, not a
+            # verified allowlist -- an untagged pool address would still slip
+            # through and inflate this number, so treat it as informational,
+            # not authoritative.
+            try:
+                result.holder_count = int(info.get("holder_count", 0) or 0)
+            except (TypeError, ValueError):
+                result.holder_count = 0
+            result.owner_percent = _pct("owner_percent")
+            holders = info.get("holders") or []
+            _exclude_tags = ("burn", "pool", "lp", "router", "pancake", "uniswap", "swap")
+            best = 0.0
+            for h in holders:
+                tag_l = str(h.get("tag", "")).lower()
+                if any(kw in tag_l for kw in _exclude_tags):
+                    continue
+                try:
+                    pct = float(h.get("percent", 0) or 0) * 100
+                except (TypeError, ValueError):
+                    continue
+                best = max(best, pct)
+            result.top1_holder_pct = best
 
             if result.has_risk:
                 logger.info(f"🔒 GoPlus check flagged [{tag}]: {', '.join(result.risk_reasons)}")
@@ -4934,9 +5186,14 @@ async def run_detections(token: TokenInfo, session: aiohttp.ClientSession = None
             alerted_symbol_registry[token.symbol.upper().strip()] = {
                 "mint": token.mint, "chain_id": token.chain_id, "alerted_at": now,
             }
-            msg_id = await _send_telegram_direct(format_gem_alert(token, alert_reason, distro, security))
+            alert_text = format_gem_alert(token, alert_reason, distro, security)
+            msg_id = await _send_telegram_direct(alert_text)
             if msg_id:
                 token.alert_message_id = msg_id  # store for reply-threading
+            # [v4.50] Fan out the identical alert to every approved subscriber.
+            # Backgrounded so a slow/failing fan-out never delays the admin's
+            # own alert above, which just already sent synchronously.
+            asyncio.create_task(_fanout_alert_to_subscribers(alert_text))
             src = "⚡WS" if token.ws_discovered else "📡Poll"
             buy_info = f"BR={live_buy_ratio:.0%} B1h={token.buys_h1}"
             ws_info = f"WS={token.ws_buy_count}B/{token.ws_sell_count}S" if ws_total > 0 else ""
@@ -5776,6 +6033,13 @@ async def status():
         "pumpfun_direct": pumpfun_direct_stats if PUMPFUN_DIRECT_MODE != "off" else None,
         "fourmeme": {**fourmeme_stats, "mode": FOURMEME_MODE} if FOURMEME_MODE != "off" else None,
         "flap": {**flap_stats, "mode": FLAP_MODE} if FLAP_MODE != "off" else None,
+        # [v4.50] Subscriber counts (pending/approved/revoked) — admin panel
+        # is at /admin. Zero fields here means the DB is unavailable, not
+        # "zero subscribers exist" — check alert_db's own log line at
+        # startup ("Alert history DB ready" / "unavailable") to tell those
+        # apart.
+        "subscribers": await alert_db.count_subscribers_async(),
+        "admin_panel_enabled": bool(ADMIN_PASSWORD),
         "kol": {**kol_stats, "accounts": len(kol_accounts)},
         "evm_ws": {cid: s for cid, s in evm_ws_stats.items() if get_chain(cid)["has_ws"]},
         "squat_guard": {
@@ -5790,6 +6054,191 @@ async def status():
 @app.get("/dashboard", response_class=HTMLResponse)
 async def dashboard():
     return build_dashboard_html()
+
+
+# ============================================================================
+# [v4.50] Admin panel — approve/revoke who gets alert access
+# ============================================================================
+# Cookie-based session, signed (not encrypted — there's nothing secret in
+# "this browser is logged in as the one admin") with HMAC-SHA256 over
+# ADMIN_SESSION_SECRET. No session store needed: the cookie IS the session,
+# self-verifying on every request. ADMIN_PASSWORD unset means the panel
+# refuses ALL access outright (see _require_admin) rather than falling open
+# — an admin panel with no password configured must never be reachable.
+_ADMIN_COOKIE = "astaroth_admin"
+
+
+def _admin_session_token() -> str:
+    expiry = str(int(time.time()) + ADMIN_SESSION_MAX_AGE)
+    sig = hmac.new(ADMIN_SESSION_SECRET.encode(), f"admin:{expiry}".encode(), hashlib.sha256).hexdigest()
+    return f"{expiry}:{sig}"
+
+
+def _verify_admin_session(cookie_value: Optional[str]) -> bool:
+    if not cookie_value or ":" not in cookie_value:
+        return False
+    expiry, _, sig = cookie_value.partition(":")
+    if not expiry.isdigit() or int(expiry) < time.time():
+        return False
+    expected = hmac.new(ADMIN_SESSION_SECRET.encode(), f"admin:{expiry}".encode(), hashlib.sha256).hexdigest()
+    return hmac.compare_digest(sig, expected)
+
+
+def _require_admin(astaroth_admin: Optional[str]) -> bool:
+    """True only if ADMIN_PASSWORD is actually configured AND the session
+    cookie verifies. Both conditions are required — a valid-looking cookie
+    means nothing if the deployment never set a password in the first
+    place (e.g. ADMIN_SESSION_SECRET fell back to a random per-restart
+    value and somehow a cookie still matched some other session's token —
+    belt-and-suspenders, not just relying on the cookie alone)."""
+    return bool(ADMIN_PASSWORD) and _verify_admin_session(astaroth_admin)
+
+
+def _admin_page_shell(body: str) -> str:
+    return f"""<!DOCTYPE html>
+<html>
+<head>
+<title>ASTAROTH Admin</title>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<style>
+body{{font-family:monospace;background:#0a0a0a;color:#e0e0e0;margin:0;padding:20px;}}
+h1{{color:#00ff88;margin:0 0 20px 0;}}
+h2{{color:#00ccff;margin-top:30px;font-size:1.1em;}}
+table{{border-collapse:collapse;width:100%;max-width:800px;margin-top:10px;}}
+th{{background:#1a1a2e;color:#00ff88;padding:8px;text-align:left;font-size:0.85em;}}
+td{{padding:6px 8px;border-bottom:1px solid #1a1a1a;font-size:0.9em;}}
+tr:hover{{background:#111;}}
+a{{color:#00ccff;}}
+.empty{{color:#666;font-style:italic;padding:10px 0;}}
+input[type=password]{{background:#111;border:1px solid #333;color:#e0e0e0;padding:8px;border-radius:4px;font-family:monospace;}}
+button{{background:#00ff88;border:none;color:#0a0a0a;padding:6px 14px;border-radius:4px;font-family:monospace;font-weight:bold;cursor:pointer;}}
+button.revoke{{background:#ff4444;color:#fff;}}
+button.approve{{background:#00ff88;}}
+form{{display:inline;}}
+.top-bar{{display:flex;justify-content:space-between;align-items:center;max-width:800px;}}
+.badge{{background:#1a1a2e;padding:2px 8px;border-radius:3px;font-size:0.8em;margin-left:8px;}}
+</style>
+</head>
+<body>
+{body}
+</body>
+</html>"""
+
+
+def _subscriber_rows_html(subs: List[Dict], action: str) -> str:
+    if not subs:
+        return '<div class="empty">None.</div>'
+    rows = ""
+    for s in subs:
+        who = f"@{s['username']}" if s.get("username") else (s.get("first_name") or s["telegram_user_id"])
+        when = time.strftime("%Y-%m-%d %H:%M", time.localtime(s.get("requested_at") or 0))
+        action_html = ""
+        if action == "approve":
+            action_html = (
+                f"<form method='post' action='/admin/approve/{s['id']}'>"
+                f"<button class='approve' type='submit'>Approve</button></form> "
+                f"<form method='post' action='/admin/revoke/{s['id']}'>"
+                f"<button class='revoke' type='submit'>Deny</button></form>"
+            )
+        elif action == "revoke":
+            action_html = (
+                f"<form method='post' action='/admin/revoke/{s['id']}'>"
+                f"<button class='revoke' type='submit'>Revoke</button></form>"
+            )
+        elif action == "approve_only":  # revoked list — allow re-approving
+            action_html = (
+                f"<form method='post' action='/admin/approve/{s['id']}'>"
+                f"<button class='approve' type='submit'>Re-approve</button></form>"
+            )
+        rows += (
+            f"<tr><td>{html.escape(who)}</td><td>{html.escape(s['telegram_user_id'])}</td>"
+            f"<td>{when}</td><td>{action_html}</td></tr>"
+        )
+    return f"<table><tr><th>User</th><th>Telegram ID</th><th>Requested</th><th>Action</th></tr>{rows}</table>"
+
+
+@app.get("/admin", response_class=HTMLResponse)
+async def admin_panel(astaroth_admin: Optional[str] = Cookie(default=None)):
+    if not ADMIN_PASSWORD:
+        return _admin_page_shell(
+            "<h1>🔒 Admin Panel</h1>"
+            "<p style='color:#ff4444'>ADMIN_PASSWORD is not set — this panel is disabled. "
+            "Set ADMIN_PASSWORD in your environment to enable it.</p>"
+        )
+    if not _require_admin(astaroth_admin):
+        return _admin_page_shell(
+            "<h1>🔒 Admin Login</h1>"
+            "<form method='post' action='/admin/login'>"
+            "<input type='password' name='password' placeholder='Admin password' autofocus> "
+            "<button type='submit'>Login</button>"
+            "</form>"
+        )
+
+    pending = await alert_db.list_subscribers_async("pending")
+    approved = await alert_db.list_subscribers_async("approved")
+    revoked = await alert_db.list_subscribers_async("revoked")
+
+    body = (
+        "<div class='top-bar'><h1>🔱 ASTAROTH Admin</h1>"
+        "<form method='post' action='/admin/logout'><button type='submit'>Logout</button></form></div>"
+        f"<h2>⏳ Pending requests <span class='badge'>{len(pending)}</span></h2>"
+        f"{_subscriber_rows_html(pending, 'approve')}"
+        f"<h2>✅ Approved <span class='badge'>{len(approved)}</span></h2>"
+        f"{_subscriber_rows_html(approved, 'revoke')}"
+        f"<h2>🚫 Revoked <span class='badge'>{len(revoked)}</span></h2>"
+        f"{_subscriber_rows_html(revoked, 'approve_only')}"
+    )
+    return _admin_page_shell(body)
+
+
+@app.post("/admin/login")
+async def admin_login(password: str = Form(...)):
+    if not ADMIN_PASSWORD or not hmac.compare_digest(password, ADMIN_PASSWORD):
+        return _admin_page_shell(
+            "<h1>🔒 Admin Login</h1>"
+            "<p style='color:#ff4444'>Incorrect password.</p>"
+            "<form method='post' action='/admin/login'>"
+            "<input type='password' name='password' placeholder='Admin password' autofocus> "
+            "<button type='submit'>Login</button>"
+            "</form>"
+        )
+    resp = RedirectResponse(url="/admin", status_code=303)
+    resp.set_cookie(_ADMIN_COOKIE, _admin_session_token(), max_age=ADMIN_SESSION_MAX_AGE,
+                     httponly=True, samesite="lax")
+    return resp
+
+
+@app.post("/admin/logout")
+async def admin_logout():
+    resp = RedirectResponse(url="/admin", status_code=303)
+    resp.delete_cookie(_ADMIN_COOKIE)
+    return resp
+
+
+@app.post("/admin/approve/{sub_id}")
+async def admin_approve(sub_id: int, astaroth_admin: Optional[str] = Cookie(default=None)):
+    if not _require_admin(astaroth_admin):
+        return RedirectResponse(url="/admin", status_code=303)
+    row = await alert_db.approve_subscriber_async(sub_id)
+    if row:
+        who = f"@{row['username']}" if row.get("username") else (row.get("first_name") or row["telegram_user_id"])
+        logger.info(f"👑 Admin approved subscriber {who} (id {row['telegram_user_id']})")
+        asyncio.create_task(send_telegram_now(
+            "✅ <b>You've been approved!</b> You'll now receive ASTAROTH gem alerts here.",
+            chat_id=row["telegram_chat_id"],
+        ))
+    return RedirectResponse(url="/admin", status_code=303)
+
+
+@app.post("/admin/revoke/{sub_id}")
+async def admin_revoke(sub_id: int, astaroth_admin: Optional[str] = Cookie(default=None)):
+    if not _require_admin(astaroth_admin):
+        return RedirectResponse(url="/admin", status_code=303)
+    row = await alert_db.revoke_subscriber_async(sub_id)
+    if row:
+        who = f"@{row['username']}" if row.get("username") else (row.get("first_name") or row["telegram_user_id"])
+        logger.info(f"👑 Admin revoked subscriber {who} (id {row['telegram_user_id']})")
+    return RedirectResponse(url="/admin", status_code=303)
 
 
 @app.get("/db/alerts")
@@ -5862,7 +6311,13 @@ async def telegram_webhook(request: Request):
         if message:
             text = message.get("text", "")
             if text.startswith("/"):
-                asyncio.create_task(handle_telegram_command(text))
+                # [v4.50] Thread through who actually sent this — previously
+                # discarded, so every reply went to the admin's own chat
+                # regardless of who typed the command. Needed for both fixing
+                # that and for the /start subscriber-request flow.
+                chat_id = (message.get("chat") or {}).get("id")
+                user = message.get("from") or {}
+                asyncio.create_task(handle_telegram_command(text, chat_id=chat_id, user=user))
         return JSONResponse({"ok": True})
     except Exception as e:
         logger.error(f"Telegram webhook error: {e}")
