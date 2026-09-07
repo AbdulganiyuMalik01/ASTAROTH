@@ -307,6 +307,62 @@ fourmeme_stats = {
 }
 fourmeme_sub_id: Dict[str, Optional[str]] = {}  # only "bsc" key ever used
 
+# ============================================================================
+# [v4.49] Flap.sh -- BSC's other major bonding-curve launchpad (four.meme's
+# biggest competitor there). Same gap as four.meme closes: Flap tokens live
+# entirely on Flap's own constant-product curve until ~80% of total supply is
+# sold, at which point the rest migrates to a real DEX pair -- invisible to
+# the PancakeV2/V3 factory watch until then. Adds a FOURTH address-filtered
+# logs subscription on the same Alchemy BSC WS connection, for the Portal
+# contract's TokenCreated / TokenBought / TokenSold events.
+#
+# Portal contract address and event signatures sourced from Bitquery's
+# Flap.sh API docs (docs.bitquery.io/docs/blockchain/BSC/flap-sh) and Flap's
+# own bot-developer docs (docs.flap.sh/dev/launch-a-token,
+# docs.flap.sh/dev/trade-tokens), checked 2026-09-07. The Portal address
+# independently passed EIP-55 checksum validation here (recomputed, not just
+# eyeballed) -- a corrupted address would essentially never coincidentally
+# pass that check, so this is strong (though not on-chain-verified)
+# confirmation it was transcribed correctly by that source. Topic0 hashes
+# below are independently computed via keccak256 of the exact documented
+# signatures, same as every other topic0 in this file -- not copied from any
+# third party.
+#
+# Same caveat as four.meme, and for the same reason: Flap's bonding-curve
+# pricing formula IS published ((x+h)(y+r)=K with chain-dependent virtual
+# reserves r/h/K, graduation at ~80% of supply sold), but the actual
+# BSC-specific r/h/K values are not published anywhere found here -- Flap's
+# own docs explicitly warn against hardcoding them and say to read them
+# per-token from the Portal's getTokenV5() view function on-chain, which is
+# a real RPC call per new token and out of scope for this pass. So exactly
+# like four.meme: no real market_cap is computed here. Cumulative BNB raised
+# (TokenInfo.flap_raised_usd) is tracked as a curve-progress proxy instead,
+# feeding a dedicated CURVE🚩 alert path that can
+# never touch or mix with the real-dollar-MC-gated paths every other signal
+# uses.
+#
+# Ships in "off" mode by default -- same off/shadow/live rollout as
+# FOURMEME_MODE (see that block above). Recommend running FLAP_MODE=shadow
+# first and comparing decoded symbols/names/raised-amounts against flap.sh
+# or BscScan before trusting FLAP_MODE=live.
+FLAP_PORTAL = "0xe2ce6ab80874fa9fa2aae65d277dd6b8e65c9de0"  # BSC Portal contract
+# keccak256("TokenCreated(uint256,address,uint256,address,string,string,string)")
+_FLAP_CREATE_TOPIC = "0x504e7f360b2e5fe33cbaaae4c593bc55305328341bf79009e43e0e3b7f699603"
+# keccak256("TokenBought(uint256,address,address,uint256,uint256,uint256,uint256)")
+_FLAP_BOUGHT_TOPIC = "0xa800a2038683844fac66747f771bfdfae862eb28b16bcfa387afa9fbacce8ff7"
+# keccak256("TokenSold(uint256,address,address,uint256,uint256,uint256,uint256)")
+_FLAP_SOLD_TOPIC = "0x03a4693e592f5e75dc7c136acb39b146d2b4966c0e509c34f362dee02b3b861a"
+
+FLAP_MODE = os.getenv("FLAP_MODE", "off").strip().lower()
+FLAP_MIN_RAISED_USD = float(os.getenv("FLAP_MIN_RAISED_USD", "2000"))
+FLAP_MAX_RAISED_USD = float(os.getenv("FLAP_MAX_RAISED_USD", "12000"))
+flap_stats = {
+    "connected": False, "creates_decoded": 0, "buys_decoded": 0,
+    "sells_decoded": 0, "decode_errors": 0, "tokens_tracked": 0, "curve_alerts": 0,
+}
+flap_sub_id: Dict[str, Optional[str]] = {}  # only "bsc" key ever used
+
+
 # The "other side" of a pair — when a factory event fires, whichever token is
 # NOT one of these is the new listing. If neither side matches (two unknown
 # tokens paired together) we fall back to token0 as a best-effort guess.
@@ -1051,6 +1107,11 @@ class TokenInfo:
     # used only by the separate CURVE🌊 path in run_detections -- it can
     # never reach or be confused with the real-dollar-MC-gated paths.
     fourmeme_raised_usd: float = 0.0
+    # [v4.49] Same curve-progress proxy for Flap.sh -- see the Flap constants
+    # block for why this holds raised BNB (in USD) rather than a real market
+    # cap. Only ever nonzero for a token actually created via Flap's Portal
+    # contract; a generic BSC stub or a four.meme stub both leave this at 0.
+    flap_raised_usd: float = 0.0
 
 tokens: Dict[str, TokenInfo] = {}
 tokens_lock = asyncio.Lock()
@@ -1262,9 +1323,13 @@ def effective_liq_vol_buyratio(token: TokenInfo) -> tuple:
     # buy/sell counts exist (from TokenPurchase/TokenSale), just no
     # DexScreener liquidity/volume yet. Uses fourmeme_raised_usd (cumulative
     # BNB raised) as the liquidity proxy — NOT market_cap, see TokenInfo.
+    # [v4.49] `or flap_raised_usd` — same proxy, same reasoning, for a Flap.sh
+    # stub. Exactly one of the two is ever nonzero for a given mint (a mint
+    # only gets created by whichever launchpad's WS handler sees it first),
+    # so this is safe to combine without a separate branch.
     if token.chain_id == "bsc" and token.ws_pre_enrichment and token.liquidity == 0:
         ws_total = token.ws_buy_count + token.ws_sell_count
-        liq = token.fourmeme_raised_usd
+        liq = token.fourmeme_raised_usd or token.flap_raised_usd
         vol = token.ws_buy_vol_usd  # real buy-side volume from live WS trades
         buy_ratio = token.ws_buy_count / max(ws_total, 1) if ws_total >= 5 else token.buy_ratio
         return liq, vol, buy_ratio
@@ -3204,6 +3269,154 @@ async def _handle_fourmeme_log(log: dict) -> None:
         token.ws_sell_vol_usd += cost_usd
 
 
+# ============================================================================
+# [v4.49] Flap.sh decode -- see the FLAP_PORTAL constants block for sourcing.
+# ============================================================================
+def _decode_flap_create(log: dict) -> Optional[dict]:
+    """
+    TokenCreated(uint256 ts, address creator, uint256 nonce, address token,
+                 string name, string symbol, string meta)
+    7 head words; name/symbol/meta are dynamic (offset pointers in their head
+    slot), same ABI-tuple shape as four.meme's TokenCreate -- reuses the same
+    _abi_word_addr/_abi_word_uint/_abi_dyn_string helpers.
+    """
+    words = _log_data_words(log)
+    if len(words) < 7:
+        return None
+    try:
+        return {
+            "ts": _abi_word_uint(words[0]),
+            "creator": _abi_word_addr(words[1]),
+            "nonce": _abi_word_uint(words[2]),
+            "token": _abi_word_addr(words[3]),
+            "name": _abi_dyn_string(words, _abi_word_uint(words[4])),
+            "symbol": _abi_dyn_string(words, _abi_word_uint(words[5])),
+            "meta": _abi_dyn_string(words, _abi_word_uint(words[6])),
+        }
+    except Exception:
+        return None
+
+
+def _decode_flap_trade(log: dict) -> Optional[dict]:
+    """
+    TokenBought / TokenSold (identical shape):
+    (uint256 ts, address token, address account, uint256 amount, uint256 eth,
+     uint256 fee, uint256 postPrice)
+    All 7 params are static (no strings) -- straight positional decode.
+    """
+    words = _log_data_words(log)
+    if len(words) < 7:
+        return None
+    try:
+        return {
+            "ts": _abi_word_uint(words[0]),
+            "token": _abi_word_addr(words[1]),
+            "account": _abi_word_addr(words[2]),
+            "amount": _abi_word_uint(words[3]),
+            "eth": _abi_word_uint(words[4]),
+            "fee": _abi_word_uint(words[5]),
+            "post_price": _abi_word_uint(words[6]),
+        }
+    except Exception:
+        return None
+
+
+async def _handle_flap_log(log: dict) -> None:
+    """
+    Routes a Flap Portal log to the right decoder by topic0, then either logs
+    it (shadow mode) or feeds it into live tracking. Mirrors
+    _handle_fourmeme_log exactly -- see the FLAP_PORTAL comment block for the
+    off/shadow/live rollout design and why flap_raised_usd (not market_cap)
+    is what gets updated here. Reuses _FOURMEME_WBNB for the BNB->USD
+    conversion since it's the same WBNB address regardless of which
+    launchpad emitted the trade.
+    """
+    topics = log.get("topics", [])
+    if not topics:
+        return
+    topic0 = topics[0].lower()
+
+    if topic0 == _FLAP_CREATE_TOPIC:
+        info = _decode_flap_create(log)
+        if not info or not info.get("token"):
+            flap_stats["decode_errors"] += 1
+            return
+        flap_stats["creates_decoded"] += 1
+        mint = info["token"].lower()
+
+        if FLAP_MODE == "shadow":
+            logger.info(
+                f"🚩 [shadow] Flap CREATE ${info['symbol']} ({info['name']}) "
+                f"{mint[:10]}... nonce={info['nonce']}"
+            )
+            return
+
+        if mint in tokens or len(tokens) >= MAX_TRACKED_TOKENS:
+            return
+        async with tokens_lock:
+            if mint not in tokens:
+                tokens[mint] = TokenInfo(
+                    mint=mint, symbol=(info["symbol"] or "???")[:20],
+                    name=(info["name"] or "")[:64], created_at=time.time(),
+                    chain_id="bsc", ws_discovered=True, ws_pre_enrichment=True,
+                )
+        flap_stats["tokens_tracked"] += 1
+        logger.info(f"🚩 Flap NEW: ${info['symbol']} ({mint[:10]}...)")
+
+        # Same reasoning as four.meme's create handler: queue through the
+        # normal WS-discovery enrichment pipeline so a post-graduation
+        # DexScreener pair upgrades this exact stub in place, without ever
+        # touching seen_mints (that set only dedupes the PancakeV2/V3 factory
+        # watch, and this token's eventual migration pair-creation event
+        # should still reach that path normally).
+        if ws_discovery_queue is not None:
+            await ws_discovery_queue.put({
+                "mint": mint, "symbol": info["symbol"] or "???",
+                "name": info["name"] or "", "chain_id": "bsc",
+                "created_at": time.time(), "ws_discovered": True,
+                "ws_initial_buy_sol": 0.0, "mc_sol_at_creation": 0.0,
+            })
+        return
+
+    if topic0 not in (_FLAP_BOUGHT_TOPIC, _FLAP_SOLD_TOPIC):
+        return
+
+    trade = _decode_flap_trade(log)
+    if not trade or not trade.get("token"):
+        flap_stats["decode_errors"] += 1
+        return
+    mint = trade["token"].lower()
+    is_buy = topic0 == _FLAP_BOUGHT_TOPIC
+    flap_stats["buys_decoded" if is_buy else "sells_decoded"] += 1
+
+    eth_usd = _evm_amount_to_usd("bsc", _FOURMEME_WBNB, trade["eth"])
+
+    if FLAP_MODE == "shadow":
+        logger.debug(
+            f"🚩 [shadow] Flap {'BUY' if is_buy else 'SELL'} {mint[:10]}... "
+            f"eth=${eth_usd:,.0f}"
+        )
+        return
+
+    if mint not in tokens:
+        return  # not a token we're tracking (e.g. subscription started mid-curve)
+    token = tokens[mint]
+    # [v4.49] Unlike four.meme's `funds` (an explicit running-total field),
+    # Flap's TokenBought/TokenSold only give the per-trade `eth` amount, so
+    # the cumulative raised figure is accumulated here trade-by-trade. A buy
+    # adds to the curve's BNB reserve; a sell withdraws from it -- mirrors
+    # the constant-product curve's actual reserve movement, not just a buy
+    # tally, so a sell-heavy token doesn't read as still-climbing.
+    if is_buy:
+        token.flap_raised_usd += eth_usd
+        token.ws_buy_count += 1
+        token.ws_buy_vol_usd += eth_usd
+    else:
+        token.flap_raised_usd = max(0.0, token.flap_raised_usd - eth_usd)
+        token.ws_sell_count += 1
+        token.ws_sell_vol_usd += eth_usd
+
+
 async def _handle_evm_swap_log(chain_id: str, log: dict) -> None:
     """
     Decode a Swap event (V2 In/Out style or V3 signed-delta style) on a pair
@@ -3387,6 +3600,7 @@ async def evm_ws_listener(chain_id: str):
                 evm_swap_sub_id[chain_id] = None
                 evm_factory_sub_id[chain_id] = None
                 fourmeme_sub_id[chain_id] = None
+                flap_sub_id[chain_id] = None
 
                 await ws.send(json.dumps({
                     "jsonrpc": "2.0",
@@ -3411,6 +3625,20 @@ async def evm_ws_listener(chain_id: str):
                     fourmeme_stats["connected"] = True
                     logger.info(f"🌊 four.meme WS subscribed [{FOURMEME_MODE}]")
 
+                # [v4.49] Flap.sh -- fourth subscription, BSC only, off by default
+                if chain_id == "bsc" and FLAP_MODE != "off":
+                    await ws.send(json.dumps({
+                        "jsonrpc": "2.0",
+                        "id": 4,
+                        "method": "eth_subscribe",
+                        "params": ["logs", {
+                            "address": FLAP_PORTAL,
+                            "topics": [[_FLAP_CREATE_TOPIC, _FLAP_BOUGHT_TOPIC, _FLAP_SOLD_TOPIC]],
+                        }],
+                    }))
+                    flap_stats["connected"] = True
+                    logger.info(f"🚩 Flap WS subscribed [{FLAP_MODE}]")
+
                 async for message in ws:
                     try:
                         data = json.loads(message)
@@ -3425,6 +3653,8 @@ async def evm_ws_listener(chain_id: str):
                                 evm_swap_sub_id[chain_id] = data["result"]
                             elif req_id == 3:
                                 fourmeme_sub_id[chain_id] = data["result"]
+                            elif req_id == 4:
+                                flap_sub_id[chain_id] = data["result"]
                             continue
 
                         params = data.get("params") or {}
@@ -3432,13 +3662,17 @@ async def evm_ws_listener(chain_id: str):
                         if not log:
                             continue
 
-                        # Route by subscription id — swap feed vs factory feed vs four.meme
+                        # Route by subscription id — swap feed vs factory feed vs
+                        # four.meme vs Flap
                         sub_id = params.get("subscription")
                         if sub_id is not None and sub_id == evm_swap_sub_id.get(chain_id):
                             await _handle_evm_swap_log(chain_id, log)
                             continue
                         if sub_id is not None and sub_id == fourmeme_sub_id.get(chain_id):
                             await _handle_fourmeme_log(log)
+                            continue
+                        if sub_id is not None and sub_id == flap_sub_id.get(chain_id):
+                            await _handle_flap_log(log)
                             continue
 
                         log_topics = log.get("topics", [])
@@ -3823,6 +4057,7 @@ def format_gem_alert(token: TokenInfo, alert_reason: str = "GEM", distro: "Distr
         "VOL💰": "💰 Vol Spike", "VACCEL📊": "📊 Vol Accel", "KOL🐦": "🐦 KOL", "GEM": "💎 Gem",
         "RUNNER🚀": "🚀 Runner (already running)",
         "CURVE🌊": "🌊 four.meme Curve",
+        "CURVE🚩": "🚩 Flap Curve",
         "FRESH🌱": "🌱 Fresh (pre-index buy pressure)",
     }
     signal_label = SIGNAL_LABELS.get(alert_reason, f"💎 {alert_reason}")
@@ -3840,6 +4075,12 @@ def format_gem_alert(token: TokenInfo, alert_reason: str = "GEM", distro: "Distr
     # of a misleading "MC $0".
     if alert_reason == "CURVE🌊":
         mc_s = f"{fmt_usd_short(token.fourmeme_raised_usd)} raised (of ~{FOURMEME_GRADUATION_BNB:.0f} BNB curve)"
+    elif alert_reason == "CURVE🚩":
+        # [v4.49] Flap graduates at ~80% of supply sold, not a fixed BNB
+        # target like four.meme -- no verified fixed number to show here (see
+        # the FLAP_PORTAL comment block), so this shows raised BNB alone
+        # rather than a misleading "of ~X BNB" fraction.
+        mc_s = f"{fmt_usd_short(token.flap_raised_usd)} raised on curve"
     elif alert_reason == "FRESH🌱":
         # [v4.36] No DexScreener data yet for this stub — a literal "$0" here
         # would read as a dead/worthless token when the opposite is true.
@@ -3871,6 +4112,14 @@ def format_gem_alert(token: TokenInfo, alert_reason: str = "GEM", distro: "Distr
         # Pre-migration four.meme token — no DexScreener pair exists yet,
         # a dexscreener.com link here would just 404.
         links = f"<a href='https://four.meme/token/{token.mint}'>four.meme</a> · <a href='https://bscscan.com/token/{token.mint}'>Scan</a>"
+    elif alert_reason == "CURVE🚩":
+        # Pre-migration Flap token — same reasoning as four.meme above, no
+        # DexScreener pair exists yet. URL pattern (flap.sh/token/<address>)
+        # is a best guess, NOT independently verified against a live token
+        # page from this environment — cosmetic link only, worst case a 404,
+        # no effect on detection/alerting (same caveat as the Robinhood Chain
+        # explorer link elsewhere in this function).
+        links = f"<a href='https://flap.sh/token/{token.mint}'>Flap</a> · <a href='https://bscscan.com/token/{token.mint}'>Scan</a>"
     elif token.chain_id == "solana":
         links = f"<a href='{_dex_url}'>DEX</a> · <a href='https://pump.fun/{token.mint}'>Pump</a>"
     elif token.chain_id == "bsc":
@@ -4556,6 +4805,25 @@ async def run_detections(token: TokenInfo, session: aiohttp.ClientSession = None
                 and not_suppressed
             )
 
+        # ── [v4.49] Flap.sh curve-momentum path (BSC bonding-curve, pre-migration) ──
+        # Exact mirror of fourmeme_curve_running above, using flap_raised_usd
+        # instead — see the FLAP_PORTAL comment block / TokenInfo.flap_raised_usd
+        # for why this is a raised-BNB proxy rather than a real market cap.
+        # A given BSC stub can only ever have ONE of fourmeme_raised_usd /
+        # flap_raised_usd nonzero (whichever launchpad's WS handler created
+        # it), so this and fourmeme_curve_running can never both be true for
+        # the same token.
+        flap_curve_running = False
+        if (token.chain_id == "bsc" and token.ws_pre_enrichment
+                and token.flap_raised_usd > 0):
+            ws_total_flap = token.ws_buy_count + token.ws_sell_count
+            flap_curve_running = (
+                FLAP_MIN_RAISED_USD <= token.flap_raised_usd <= FLAP_MAX_RAISED_USD
+                and ws_total_flap >= 5
+                and token.ws_buy_count / max(token.ws_sell_count, 1) >= GEM_WS_BUY_PRESSURE
+                and not_suppressed
+            )
+
         # ── [v4.36] FRESH🌱 path: vanilla EVM pair, real buy pressure, no
         # DexScreener data yet ────────────────────────────────────────────
         # See the pre-track stub added in evm_ws_listener: PancakeV2/V3,
@@ -4598,6 +4866,9 @@ async def run_detections(token: TokenInfo, session: aiohttp.ClientSession = None
         elif fourmeme_curve_running:
             alert_reason = "CURVE🌊"
             fourmeme_stats["curve_alerts"] += 1
+        elif flap_curve_running:
+            alert_reason = "CURVE🚩"
+            flap_stats["curve_alerts"] += 1
         elif evm_fresh_momentum:
             alert_reason = "FRESH🌱"
             evm_ws_stats[token.chain_id]["fresh_alerts"] += 1
@@ -5504,6 +5775,7 @@ async def status():
         "ws": ws_stats,
         "pumpfun_direct": pumpfun_direct_stats if PUMPFUN_DIRECT_MODE != "off" else None,
         "fourmeme": {**fourmeme_stats, "mode": FOURMEME_MODE} if FOURMEME_MODE != "off" else None,
+        "flap": {**flap_stats, "mode": FLAP_MODE} if FLAP_MODE != "off" else None,
         "kol": {**kol_stats, "accounts": len(kol_accounts)},
         "evm_ws": {cid: s for cid, s in evm_ws_stats.items() if get_chain(cid)["has_ws"]},
         "squat_guard": {
