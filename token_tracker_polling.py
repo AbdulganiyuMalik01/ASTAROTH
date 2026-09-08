@@ -1050,6 +1050,30 @@ class BuyEvent:
     sol_amount: float
     buyer: str
 
+
+@dataclass
+class TradeRecord:
+    """
+    [v4.52] One captured buy/sell for a tracked token, wallet-attributed.
+    Backs three new alert-card features: dev-sold detection, bundle/sniper
+    detection, and the "Top 10 in detail" per-trader table. `wallet` is
+    already normalized the same way the rest of the codebase normalizes
+    addresses for that chain (Solana base58 as-is, EVM lowercase-hex) by
+    whichever call site appends this record — see _record_trade.
+    `token_amount` is in the traded token's own raw display units (already
+    decimals-adjusted), used for the Buy/Sell/Left columns in the top-
+    traders table; it's 0.0 wherever a given trade path can't cheaply
+    determine it (that trade still counts for bundle/sniper/dev-sold, just
+    contributes nothing to the per-wallet token-amount table).
+    """
+    timestamp: float
+    wallet: str
+    usd_amount: float
+    is_buy: bool
+    mc_at_time: float = 0.0
+    token_amount: float = 0.0
+
+
 @dataclass
 class TokenInfo:
     mint: str
@@ -1132,10 +1156,67 @@ class TokenInfo:
     # cap. Only ever nonzero for a token actually created via Flap's Portal
     # contract; a generic BSC stub or a four.meme stub both leave this at 0.
     flap_raised_usd: float = 0.0
+    # [v4.52] Deployer/creator wallet, captured from the launchpad's own
+    # create event where one exists (Solana pump.fun, four.meme, Flap).
+    # Empty for tokens discovered via generic DexScreener/pair-creation
+    # polling (plain Ethereum/Base/Robinhood pairs) -- there's no on-chain
+    # "creator" field to read there, so the Dev status on those chains'
+    # alerts always shows "unknown" rather than a guess.
+    creator_wallet: str = ""
+    # True the first time any captured trade shows creator_wallet selling.
+    # Only meaningful when creator_wallet is set; see format_gem_alert's
+    # Dev status line.
+    dev_sold: bool = False
+    # [v4.52] Wallet-attributed trade history for this token, oldest-first.
+    # Populated by _record_trade from every chain's trade-decode path.
+    # Backs bundle/sniper detection and the Top 10 in detail table -- see
+    # _record_trade for the pinned-early/capped-recent trimming that keeps
+    # this bounded on a high-volume token without losing the launch-window
+    # trades bundle/sniper detection actually needs.
+    trades: List[TradeRecord] = field(default_factory=list)
 
 tokens: Dict[str, TokenInfo] = {}
 tokens_lock = asyncio.Lock()
 seen_mints: Set[str] = set()
+
+# [v4.52] Trade-history bookkeeping for TokenInfo.trades (and the matching
+# per-pending-mint list kept in _pending_sol_entries[mint]["trades"] before a
+# Solana token is promoted -- see _handle_ws_trade). A hot token can rack up
+# hundreds of trades before its alert fires; TRADE_HISTORY_CAP bounds memory
+# per token while TRADE_HISTORY_PIN keeps the earliest trades -- the exact
+# ones bundle/sniper detection needs -- from ever being evicted. Once the cap
+# is hit, new trades still come in; what gets dropped is the trade just past
+# the pinned region, oldest-of-the-unpinned-first.
+TRADE_HISTORY_CAP = 300
+TRADE_HISTORY_PIN = 60
+
+
+def _record_trade(trade_list: List["TradeRecord"], wallet: str, usd_amount: float,
+                   is_buy: bool, mc_at_time: float = 0.0, token_amount: float = 0.0,
+                   timestamp: Optional[float] = None) -> "TradeRecord":
+    """
+    Appends a TradeRecord to `trade_list` in place (mutates the list the
+    caller passed — works identically for a live TokenInfo.trades and for a
+    still-pending Solana mint's plain-dict trade list), trimming it to
+    TRADE_HISTORY_CAP while pinning the first TRADE_HISTORY_PIN entries so a
+    long-running hot token never loses its launch-window trade history.
+    Returns the record that was appended, so callers can inspect it (e.g.
+    to flag dev_sold) without a second lookup.
+    """
+    rec = TradeRecord(
+        timestamp=timestamp if timestamp is not None else time.time(),
+        wallet=wallet or "",
+        usd_amount=usd_amount,
+        is_buy=is_buy,
+        mc_at_time=mc_at_time,
+        token_amount=token_amount,
+    )
+    trade_list.append(rec)
+    if len(trade_list) > TRADE_HISTORY_CAP:
+        # Drop the oldest entry just past the pinned launch-window region —
+        # keeps the list bounded without ever touching index < PIN.
+        del trade_list[TRADE_HISTORY_PIN]
+    return rec
 telegram_bot: Optional[Bot] = None
 volume_history: Dict[str, deque] = defaultdict(lambda: deque(maxlen=6))
 
@@ -2573,6 +2654,11 @@ async def _handle_ws_create(data: dict):
     initial_buy = float(data.get("initialBuy", 0) or 0)
     mc_sol = float(data.get("marketCapSol", 0) or 0)
     vsol_curve = float(data.get("vSolInBondingCurve", 0) or 0)
+    # [v4.52] deployer wallet — PumpPortal's own create payload's
+    # traderPublicKey is the launching wallet; the direct-Helius listener
+    # populates the same key from the IDL's creator field (see its call
+    # site). Threaded through _pending_sol_entries to TokenInfo.creator_wallet.
+    creator_wallet = data.get("traderPublicKey") or ""
 
     # Primary dedup: mint address is the canonical unique key
     if mint in seen_mints:
@@ -2642,6 +2728,10 @@ async def _handle_ws_create(data: dict):
         "initial_buy": initial_buy,
         "ws_buy_count": 0, "ws_sell_count": 0,
         "ws_buy_vol_usd": 0.0, "ws_sell_vol_usd": 0.0,
+        # [v4.52] carried through to TokenInfo at promotion (_finalize_sol_pending_entry)
+        "creator_wallet": creator_wallet,
+        "dev_sold": False,
+        "trades": [],
     }
     # [v4.46] Reserve at most SOL_PENDING_SUB_CAP of the shared 50-slot pool
     # for pending mints -- ws_subscribed_mints is the single shared count
@@ -2733,6 +2823,10 @@ async def _finalize_sol_pending_entry(mint: str) -> None:
                         ws_sell_count=entry["ws_sell_count"],
                         ws_buy_vol_usd=entry["ws_buy_vol_usd"],
                         ws_sell_vol_usd=entry["ws_sell_vol_usd"],
+                        # [v4.52] carried over from the pending dict — see _handle_ws_create/_handle_ws_trade
+                        creator_wallet=entry.get("creator_wallet", ""),
+                        dev_sold=entry.get("dev_sold", False),
+                        trades=entry.get("trades", []),
                     )
                     waited = time.time() - entry["created_at"]
                     logger.info(
@@ -2765,6 +2859,9 @@ async def _handle_ws_trade(data: dict):
     mc_sol = float(data.get("marketCapSol", 0) or 0)
     vsol_curve = float(data.get("vSolInBondingCurve", 0) or 0)
     usd_amount = sol_amount * WS_SOL_PRICE_USD
+    trader = data.get("traderPublicKey") or ""
+    token_amount = float(data.get("tokenAmount", 0) or 0)
+    is_buy = tx_type == "buy"
 
     # [v4.40] Still-pending mint (not yet promoted to `tokens`, or already
     # dropped) — update its pending snapshot so the one-shot delayed check in
@@ -2780,6 +2877,15 @@ async def _handle_ws_trade(data: dict):
         elif tx_type == "sell":
             pending["ws_sell_count"] += 1
             pending["ws_sell_vol_usd"] += usd_amount
+        # [v4.52] Bundle/sniper detection needs exactly these launch-window
+        # trades — capture them here, before promotion, not just after.
+        if tx_type in ("buy", "sell"):
+            rec = _record_trade(
+                pending.setdefault("trades", []), trader, usd_amount, is_buy,
+                mc_at_time=mc_sol * WS_SOL_PRICE_USD, token_amount=token_amount,
+            )
+            if not is_buy and trader and pending.get("creator_wallet") == trader:
+                pending["dev_sold"] = True
 
     if mint not in tokens:
         return
@@ -2812,6 +2918,18 @@ async def _handle_ws_trade(data: dict):
                     t.ws_liquidity_estimate = vsol_curve * WS_SOL_PRICE_USD
 
             update_composite_score(t)
+
+            # [v4.52] Trade-history tracking for the promoted token — mirrors
+            # the pending-dict capture above for tokens that already made it
+            # into `tokens` (post-migration trades, or a token that was
+            # promoted before this particular trade arrived).
+            if tx_type in ("buy", "sell"):
+                _record_trade(
+                    t.trades, trader, usd_amount, is_buy,
+                    mc_at_time=t.market_cap, token_amount=token_amount,
+                )
+                if not is_buy and trader and t.creator_wallet == trader:
+                    t.dev_sold = True
 
 
 # ============================================================================
@@ -2884,8 +3002,8 @@ def _decode_create_event(payload: bytes) -> Optional[dict]:
         _uri, off = _b_read_string(payload, off)
         mint, off = _b_read_pubkey(payload, off)
         _bonding_curve, off = _b_read_pubkey(payload, off)
-        _user, off = _b_read_pubkey(payload, off)
-        _creator, off = _b_read_pubkey(payload, off)
+        user, off = _b_read_pubkey(payload, off)
+        creator, off = _b_read_pubkey(payload, off)
         _timestamp, off = _b_read_i64(payload, off)
         virtual_token_reserves, off = _b_read_u64(payload, off)
         virtual_sol_reserves, off = _b_read_u64(payload, off)
@@ -2903,6 +3021,12 @@ def _decode_create_event(payload: bytes) -> Optional[dict]:
             "virtual_sol_reserves": virtual_sol_reserves,
             "virtual_token_reserves": virtual_token_reserves,
             "token_total_supply": token_total_supply,
+            # [v4.52] `creator` is the IDL's actual deployer-of-record field;
+            # `user` (the tx signer) is usually the same wallet for a normal
+            # direct launch but kept separately since they're distinct IDL
+            # fields — creator is what dev-sold detection tracks.
+            "creator": creator,
+            "user": user,
         }
     except (IndexError, UnicodeDecodeError, ValueError):
         return None
@@ -2919,18 +3043,22 @@ def _decode_trade_event(payload: bytes) -> Optional[dict]:
         off = 0
         mint, off = _b_read_pubkey(payload, off)
         sol_amount, off = _b_read_u64(payload, off)
-        _token_amount, off = _b_read_u64(payload, off)
+        token_amount, off = _b_read_u64(payload, off)
         is_buy, off = _b_read_bool(payload, off)
-        _user, off = _b_read_pubkey(payload, off)
+        user, off = _b_read_pubkey(payload, off)
         _timestamp, off = _b_read_i64(payload, off)
         virtual_sol_reserves, off = _b_read_u64(payload, off)
         virtual_token_reserves, off = _b_read_u64(payload, off)
         return {
             "mint": mint,
             "sol_amount": sol_amount,
+            "token_amount": token_amount,
             "is_buy": is_buy,
             "virtual_sol_reserves": virtual_sol_reserves,
             "virtual_token_reserves": virtual_token_reserves,
+            # [v4.52] trader wallet — feeds TradeRecord.wallet for dev-sold /
+            # bundle-sniper / top-traders. Not used by any pre-existing path.
+            "user": user,
         }
     except (IndexError, ValueError):
         return None
@@ -3036,6 +3164,8 @@ async def pumpfun_direct_listener():
                                     "initialBuy": 0,
                                     "marketCapSol": mc_sol,
                                     "vSolInBondingCurve": vsol,
+                                    # [v4.52] deployer wallet, for dev-sold detection
+                                    "traderPublicKey": ev.get("creator") or ev.get("user") or "",
                                 })
                             else:
                                 logger.debug(
@@ -3059,6 +3189,9 @@ async def pumpfun_direct_listener():
                                     "solAmount": ev["sol_amount"] / 1e9,
                                     "marketCapSol": mc_sol,
                                     "vSolInBondingCurve": vsol,
+                                    # [v4.52] wallet + token qty for trade-history tracking
+                                    "traderPublicKey": ev.get("user") or "",
+                                    "tokenAmount": ev.get("token_amount", 0) / 1e6,
                                 })
                             else:
                                 logger.debug(
@@ -3366,6 +3499,8 @@ async def _handle_fourmeme_log(log: dict) -> None:
                     mint=mint, symbol=(info["symbol"] or "???")[:20],
                     name=(info["name"] or "")[:64], created_at=time.time(),
                     chain_id="bsc", ws_discovered=True, ws_pre_enrichment=True,
+                    # [v4.52] deployer wallet, for dev-sold detection
+                    creator_wallet=(info.get("creator") or "").lower(),
                 )
         fourmeme_stats["tokens_tracked"] += 1
         logger.info(f"🌊 four.meme NEW: ${info['symbol']} ({mint[:10]}...)")
@@ -3419,6 +3554,20 @@ async def _handle_fourmeme_log(log: dict) -> None:
     else:
         token.ws_sell_count += 1
         token.ws_sell_vol_usd += cost_usd
+
+    # [v4.52] Trade-history tracking — `account` is the buyer/seller wallet,
+    # already decoded by _decode_fourmeme_trade; `amount` is the token
+    # quantity in raw units (standard 18-decimal BEP20). mc_at_time uses the
+    # same fourmeme_raised_usd curve-progress proxy the rest of this token's
+    # display already relies on (see the TokenInfo.fourmeme_raised_usd
+    # comment) since four.meme has no real MC pre-migration.
+    wallet = (trade.get("account") or "").lower()
+    _record_trade(
+        token.trades, wallet, cost_usd, is_buy,
+        mc_at_time=funds_usd, token_amount=trade.get("amount", 0) / 1e18,
+    )
+    if not is_buy and wallet and token.creator_wallet == wallet:
+        token.dev_sold = True
 
 
 # ============================================================================
@@ -3511,6 +3660,8 @@ async def _handle_flap_log(log: dict) -> None:
                     mint=mint, symbol=(info["symbol"] or "???")[:20],
                     name=(info["name"] or "")[:64], created_at=time.time(),
                     chain_id="bsc", ws_discovered=True, ws_pre_enrichment=True,
+                    # [v4.52] deployer wallet, for dev-sold detection
+                    creator_wallet=(info.get("creator") or "").lower(),
                 )
         flap_stats["tokens_tracked"] += 1
         logger.info(f"🚩 Flap NEW: ${info['symbol']} ({mint[:10]}...)")
@@ -3568,6 +3719,15 @@ async def _handle_flap_log(log: dict) -> None:
         token.ws_sell_count += 1
         token.ws_sell_vol_usd += eth_usd
 
+    # [v4.52] Trade-history tracking — mirrors four.meme's handler above.
+    wallet = (trade.get("account") or "").lower()
+    _record_trade(
+        token.trades, wallet, eth_usd, is_buy,
+        mc_at_time=token.flap_raised_usd, token_amount=trade.get("amount", 0) / 1e18,
+    )
+    if not is_buy and wallet and token.creator_wallet == wallet:
+        token.dev_sold = True
+
 
 async def _handle_evm_swap_log(chain_id: str, log: dict) -> None:
     """
@@ -3600,16 +3760,23 @@ async def _handle_evm_swap_log(chain_id: str, log: dict) -> None:
             amount1_out = int(words[3], 16)
             if meta["base_is_token0"]:
                 base_in, base_out = amount0_in, amount0_out
+                other_in, other_out = amount1_in, amount1_out
             else:
                 base_in, base_out = amount1_in, amount1_out
+                other_in, other_out = amount0_in, amount0_out
             is_buy = base_in > 0
             base_raw = base_in if is_buy else base_out
+            # [v4.52] the memecoin's own side of the swap — out on a buy
+            # (pool sends the token to the trader), in on a sell.
+            other_raw = other_out if is_buy else other_in
         elif topic0 == _V3_SWAP_TOPIC and len(words) >= 2:
             amount0 = _hex_word_to_signed_int(words[0])
             amount1 = _hex_word_to_signed_int(words[1])
             base_delta = amount0 if meta["base_is_token0"] else amount1
+            other_delta = amount1 if meta["base_is_token0"] else amount0
             is_buy = base_delta > 0
             base_raw = abs(base_delta)
+            other_raw = abs(other_delta)
         else:
             return
     except (ValueError, IndexError):
@@ -3624,6 +3791,22 @@ async def _handle_evm_swap_log(chain_id: str, log: dict) -> None:
 
     evm_ws_stats[chain_id]["trades_received"] += 1
 
+    # [v4.52] Trader wallet — both V2's Swap(...,address indexed to) and V3's
+    # Swap(address indexed sender, address indexed recipient, ...) carry the
+    # end recipient as the 2nd indexed topic (topics[2]); commonly the
+    # trader's own wallet for a direct swap, though a multi-hop router path
+    # can make this the router itself — best-effort like the rest of this
+    # generic-swap path (no per-token creator/dev-sold data exists here
+    # either, since these tokens are discovered via DexScreener/pair-
+    # creation polling with no create-event to read a deployer from).
+    wallet = _abi_word_addr(topics[2][2:]).lower() if len(topics) > 2 else ""
+    # No verified per-token decimals source in this generic path — default
+    # to 18 (standard ERC20/BEP20), same fallback EVM_BASE_TOKEN_DECIMALS
+    # already uses for an unrecognized base token. A non-18-decimal token's
+    # Buy/Sell/Left numbers in the top-traders table will be off by that
+    # token's actual decimals; cosmetic only, doesn't affect USD amounts.
+    token_amount = other_raw / 1e18
+
     async with tokens_lock:
         t = tokens.get(mint)
         if not t:
@@ -3634,6 +3817,10 @@ async def _handle_evm_swap_log(chain_id: str, log: dict) -> None:
         else:
             t.ws_sell_count += 1
             t.ws_sell_vol_usd += usd_amount
+        _record_trade(t.trades, wallet, usd_amount, is_buy,
+                       mc_at_time=t.market_cap, token_amount=token_amount)
+        if not is_buy and wallet and t.creator_wallet == wallet:
+            t.dev_sold = True
 
 
 async def _refresh_evm_swap_subs(ws, chain_id: str) -> None:
@@ -4197,7 +4384,110 @@ def fmt_usd_short(v: float) -> str:
     return f"${v:.0f}"
 
 
-def format_gem_alert(token: TokenInfo, alert_reason: str = "GEM", distro: "DistroResult" = None, security: "SecurityResult" = None) -> str:
+def _fmt_compact(v: float) -> str:
+    """Same compact K/M/B rounding as fmt_usd_short but with no $ prefix —
+    for raw token quantities (Buy/Sell/Left columns) rather than USD."""
+    v = abs(v)
+    if v >= 1_000_000_000:
+        return f"{v/1_000_000_000:.1f}B"
+    if v >= 1_000_000:
+        return f"{v/1_000_000:.1f}M"
+    if v >= 1_000:
+        return f"{v/1_000:.1f}K"
+    return f"{v:.0f}"
+
+
+# [v4.52] Bundle/sniper display windows — distinct from BUNDLE_WINDOW_S /
+# BUNDLE_MIN_WALLETS below (that pair drives the Solana-only Helius RPC
+# check that can BLOCK an alert entirely for extreme concentration; this
+# pair drives a purely informational line on an alert that already fired,
+# built from the WS-captured trade history in token.trades, and applies to
+# every chain that has any trade-history capture at all, not just Solana).
+# Deliberately not reusing the same constants: changing the RPC gate's
+# threshold and changing what counts as a "bundle" on the alert card are two
+# different product decisions that shouldn't be coupled by sharing a name.
+DISPLAY_BUNDLE_WINDOW_S = 4    # buys this close to launch = same-block "bundle"
+DISPLAY_SNIPER_WINDOW_S = 20   # buys after that but still this early = "sniper"
+
+
+def _compute_bundle_sniper(token: TokenInfo) -> Dict:
+    """
+    Groups token.trades' BUYS by how soon after launch they landed, relative
+    to token.launched_at (falling back to created_at if unset — e.g. a
+    four.meme/Flap stub that hasn't had its migration timestamp set yet).
+
+    Percentages here are each cluster's share of this token's OWN total
+    tracked buy volume (sum of every captured buy's usd_amount) — NOT a
+    share of total token supply. A true % of circulating/curve supply would
+    need a reliable graduation-supply constant per launchpad (verified for
+    four.meme's BNB target, not independently verified for pump.fun/Flap —
+    see the CURVE🚩 comment block), so this uses the metric that's honestly
+    computable from what's actually captured: how much of the buying that
+    happened, happened in this cluster.
+    """
+    anchor = token.launched_at or token.created_at
+    out = {"bundle_count": 0, "bundle_usd": 0.0, "bundle_pct": 0.0,
+           "sniper_count": 0, "sniper_usd": 0.0, "sniper_pct": 0.0}
+    if not anchor or not token.trades:
+        return out
+
+    buys = [tr for tr in token.trades if tr.is_buy]
+    total_buy_usd = sum(tr.usd_amount for tr in buys)
+    if total_buy_usd <= 0:
+        return out
+
+    for tr in buys:
+        age = tr.timestamp - anchor
+        if age < 0:
+            continue  # clock skew between capture points — ignore rather than misbucket
+        if age <= DISPLAY_BUNDLE_WINDOW_S:
+            out["bundle_count"] += 1
+            out["bundle_usd"] += tr.usd_amount
+        elif age <= DISPLAY_SNIPER_WINDOW_S:
+            out["sniper_count"] += 1
+            out["sniper_usd"] += tr.usd_amount
+
+    out["bundle_pct"] = (out["bundle_usd"] / total_buy_usd) * 100
+    out["sniper_pct"] = (out["sniper_usd"] / total_buy_usd) * 100
+    return out
+
+
+def _build_top_traders(token: TokenInfo, limit: int = 10) -> List[Dict]:
+    """
+    Aggregates token.trades per wallet into {wallet, first_mc, buy, sell,
+    left} rows, ranked by gross buy size (token units) descending — the
+    "Top 10 in detail" table. `left` is buy-minus-sell in the same trade-
+    captured token units, i.e. net position from what this bot has actually
+    observed on-chain for that wallet; a wallet that received/sent tokens
+    outside a captured swap (a transfer, a CEX withdrawal) won't be
+    reflected — the same inherent limitation any DEX-trade-only tracker has.
+    """
+    per_wallet: Dict[str, Dict] = {}
+    for tr in token.trades:
+        if not tr.wallet:
+            continue
+        w = per_wallet.get(tr.wallet)
+        if w is None:
+            w = {"wallet": tr.wallet, "first_mc": tr.mc_at_time, "first_ts": tr.timestamp,
+                 "buy": 0.0, "sell": 0.0}
+            per_wallet[tr.wallet] = w
+        if tr.timestamp < w["first_ts"]:
+            w["first_ts"] = tr.timestamp
+            w["first_mc"] = tr.mc_at_time
+        if tr.is_buy:
+            w["buy"] += tr.token_amount
+        else:
+            w["sell"] += tr.token_amount
+
+    for w in per_wallet.values():
+        w["left"] = max(0.0, w["buy"] - w["sell"])
+
+    ranked = sorted(per_wallet.values(), key=lambda w: w["buy"], reverse=True)
+    return ranked[:limit]
+
+
+def format_gem_alert(token: TokenInfo, alert_reason: str = "GEM", distro: "DistroResult" = None,
+                      security: "SecurityResult" = None, wallet_tags: Optional[Dict[str, Dict]] = None) -> str:
     age_str = format_launch_age(token.launched_at or token.created_at)
     chain = get_chain(token.chain_id)
     _dex_url = dex_url(token.mint, token.chain_id)
@@ -4364,9 +4654,81 @@ def format_gem_alert(token: TokenInfo, alert_reason: str = "GEM", distro: "Distr
     # actually sees it, not that it gets silently crowded out.
     if security and security.checked and security.has_risk:
         lines.append("⚠️ <b>Security:</b> " + " · ".join(security.risk_reasons[:4]))
+
+    # [v4.52] Dev-sold / Dex-paid status. Dex Paid is always shown (backed by
+    # the existing is_boosted/DEXSCREENER_BOOSTS poll — a real, DexScreener-
+    # native "paid promotion active" flag, the closest honest equivalent to
+    # what other bots label "Dex Paid"). Dev status only shows when a
+    # creator wallet was actually captured at launch (Solana pump.fun,
+    # four.meme, Flap) — see TokenInfo.creator_wallet's comment for why it's
+    # empty on generic-swap-discovered EVM tokens.
+    dev_paid_parts = []
+    if token.creator_wallet:
+        dev_paid_parts.append(f"👨‍💻 <b>Dev:</b> {'✅ Sold' if token.dev_sold else '❌ Holding'}")
+    dev_paid_parts.append(f"💵 <b>Dex Paid:</b> {'✅' if token.is_boosted else '❌'}")
+    lines.append("   ".join(dev_paid_parts))
+
+    # [v4.52] Bundle/sniper — see _compute_bundle_sniper's docstring for what
+    # the % actually measures (share of this token's tracked buy volume, not
+    # share of supply). Only shown when there's something to show: a lone
+    # early buy isn't a "bundle" in the sense this is trying to flag (a
+    # cluster of wallets, often dev-linked, buying together at launch), so
+    # bundle needs 2+ buyers; a single very-early bot buy is still a
+    # meaningful sniper signal on its own.
+    bs = _compute_bundle_sniper(token)
+    bs_parts = []
+    if bs["bundle_count"] >= 2:
+        bs_parts.append(
+            f"📦 Bundle: {bs['bundle_count']} buys, {bs['bundle_pct']:.0f}% of vol, {fmt_usd_short(bs['bundle_usd'])}"
+        )
+    if bs["sniper_count"] >= 1:
+        bs_parts.append(
+            f"🎯 Snipers: {bs['sniper_count']} buys, {bs['sniper_pct']:.0f}% of vol, {fmt_usd_short(bs['sniper_usd'])}"
+        )
+    if bs_parts:
+        lines.append("  ·  ".join(bs_parts))
+
+    # [v4.52] Insider/KOL buyer counts — wallet_tags is a precomputed
+    # {wallet: {"tag","label"}} map the caller looked up from the
+    # admin-curated wallet_tags DB table for this alert's actual buyer set
+    # (see run_detections) — format_gem_alert itself stays sync and does no
+    # DB I/O. Zero counts mean either no tagged wallets bought in, or (more
+    # likely on a fresh deploy) the admin hasn't tagged any wallets yet —
+    # see the admin panel's Wallet Tags section.
+    if wallet_tags:
+        unique_buyers = {tr.wallet for tr in token.trades if tr.is_buy and tr.wallet}
+        kol_n = sum(1 for w in unique_buyers if wallet_tags.get(w, {}).get("tag") == "kol")
+        insider_n = sum(1 for w in unique_buyers if wallet_tags.get(w, {}).get("tag") == "insider")
+        if kol_n or insider_n:
+            lines.append(f"🐋 <b>Insiders:</b> {insider_n}   🌟 <b>KOLs:</b> {kol_n}")
+
     lines.append(f"<code>{token.mint}</code>")
     if secondary_link:
         lines.append(f"<a href='{secondary_link}'>{secondary_label}</a>")
+
+    # [v4.52] "Top 10 in detail" — a native Telegram expandable blockquote
+    # (Bot API 7.0+ HTML syntax) so it doesn't bloat the collapsed message.
+    # Built entirely from token.trades (no extra API calls) — see
+    # _build_top_traders. Only rendered once at least 2 distinct wallets
+    # have traded (a 0-1-wallet table isn't useful information).
+    top_traders = _build_top_traders(token, limit=10)
+    if len(top_traders) >= 2:
+        rows = []
+        for w in top_traders:
+            addr = w["wallet"]
+            short_w = html.escape(f"{addr[:4]}..{addr[-4:]}" if len(addr) > 10 else addr)
+            tag = (wallet_tags or {}).get(addr, {}).get("tag")
+            tag_mark = " 🌟" if tag == "kol" else (" 🐋" if tag == "insider" else "")
+            sell_s = _fmt_compact(w["sell"]) if w["sell"] > 0 else "—"
+            rows.append(
+                f"{short_w}{tag_mark} | {fmt_usd_short(w['first_mc'])} | "
+                f"Buy {_fmt_compact(w['buy'])} | Sell {sell_s} | Left {_fmt_compact(w['left'])}"
+            )
+        lines.append(
+            "<blockquote expandable>Top traders (by buy size)\nUser | MCap | Buy | Sell | Left\n"
+            + "\n".join(rows) + "</blockquote>"
+        )
+
     return "\n".join(lines)
 
 
@@ -5186,7 +5548,13 @@ async def run_detections(token: TokenInfo, session: aiohttp.ClientSession = None
             alerted_symbol_registry[token.symbol.upper().strip()] = {
                 "mint": token.mint, "chain_id": token.chain_id, "alerted_at": now,
             }
-            alert_text = format_gem_alert(token, alert_reason, distro, security)
+            # [v4.52] Look up admin-tagged KOL/insider wallets among this
+            # token's actual buyers — one batched query, not one per wallet.
+            # Empty dict (DB unavailable, or nobody tagged yet) just means
+            # the alert's Insiders/KOLs line is omitted; never blocks/delays.
+            buyer_wallets = {tr.wallet for tr in token.trades if tr.is_buy and tr.wallet}
+            wallet_tags = await alert_db.get_wallet_tags_map_async(list(buyer_wallets)) if buyer_wallets else {}
+            alert_text = format_gem_alert(token, alert_reason, distro, security, wallet_tags)
             msg_id = await _send_telegram_direct(alert_text)
             if msg_id:
                 token.alert_message_id = msg_id  # store for reply-threading
@@ -6157,6 +6525,26 @@ def _subscriber_rows_html(subs: List[Dict], action: str) -> str:
     return f"<table><tr><th>User</th><th>Telegram ID</th><th>Requested</th><th>Action</th></tr>{rows}</table>"
 
 
+def _wallet_tag_rows_html(rows: List[Dict]) -> str:
+    if not rows:
+        return '<div class="empty">None tagged yet.</div>'
+    out = ""
+    for r in rows:
+        badge = "🌟 KOL" if r["tag"] == "kol" else "🐋 Insider"
+        label = html.escape(r.get("label") or "")
+        chain = html.escape(r.get("chain_id") or "any chain")
+        action_html = (
+            f"<form method='post' action='/admin/tag/remove'>"
+            f"<input type='hidden' name='wallet' value='{html.escape(r['wallet'])}'>"
+            f"<button class='revoke' type='submit'>Remove</button></form>"
+        )
+        out += (
+            f"<tr><td style='font-family:monospace;font-size:0.85em'>{html.escape(r['wallet'])}</td>"
+            f"<td>{badge}</td><td>{label}</td><td>{chain}</td><td>{action_html}</td></tr>"
+        )
+    return f"<table><tr><th>Wallet</th><th>Tag</th><th>Label</th><th>Chain</th><th>Action</th></tr>{out}</table>"
+
+
 @app.get("/admin", response_class=HTMLResponse)
 async def admin_panel(astaroth_admin: Optional[str] = Cookie(default=None)):
     if not ADMIN_PASSWORD:
@@ -6177,6 +6565,7 @@ async def admin_panel(astaroth_admin: Optional[str] = Cookie(default=None)):
     pending = await alert_db.list_subscribers_async("pending")
     approved = await alert_db.list_subscribers_async("approved")
     revoked = await alert_db.list_subscribers_async("revoked")
+    wallet_tags = await alert_db.list_wallet_tags_async()
 
     body = (
         "<div class='top-bar'><h1>🔱 ASTAROTH Admin</h1>"
@@ -6187,6 +6576,27 @@ async def admin_panel(astaroth_admin: Optional[str] = Cookie(default=None)):
         f"{_subscriber_rows_html(approved, 'revoke')}"
         f"<h2>🚫 Revoked <span class='badge'>{len(revoked)}</span></h2>"
         f"{_subscriber_rows_html(revoked, 'approve_only')}"
+        f"<h2>🐋 KOL / Insider wallet tags <span class='badge'>{len(wallet_tags)}</span></h2>"
+        "<p style='color:#888;font-size:0.85em;max-width:800px'>Tag wallets you know are a KOL or an "
+        "insider — tagged wallets that buy in show up on the alert card's Insiders/KOLs line and are "
+        "marked in the top-traders table. There's no automatic feed for this; it only knows what you "
+        "add here.</p>"
+        "<form method='post' action='/admin/tag/add' style='margin-bottom:12px'>"
+        "<input type='text' name='wallet' placeholder='Wallet address' required "
+        "style='background:#111;border:1px solid #333;color:#e0e0e0;padding:6px;border-radius:4px;"
+        "font-family:monospace;width:260px'> "
+        "<select name='tag' style='background:#111;border:1px solid #333;color:#e0e0e0;padding:6px;"
+        "border-radius:4px;font-family:monospace'>"
+        "<option value='kol'>KOL</option><option value='insider'>Insider</option></select> "
+        "<input type='text' name='label' placeholder='Label (optional)' "
+        "style='background:#111;border:1px solid #333;color:#e0e0e0;padding:6px;border-radius:4px;"
+        "font-family:monospace;width:160px'> "
+        "<input type='text' name='chain_id' placeholder='Chain (optional)' "
+        "style='background:#111;border:1px solid #333;color:#e0e0e0;padding:6px;border-radius:4px;"
+        "font-family:monospace;width:110px'> "
+        "<button type='submit'>Add / Update</button>"
+        "</form>"
+        f"{_wallet_tag_rows_html(wallet_tags)}"
     )
     return _admin_page_shell(body)
 
@@ -6238,6 +6648,35 @@ async def admin_revoke(sub_id: int, astaroth_admin: Optional[str] = Cookie(defau
     if row:
         who = f"@{row['username']}" if row.get("username") else (row.get("first_name") or row["telegram_user_id"])
         logger.info(f"👑 Admin revoked subscriber {who} (id {row['telegram_user_id']})")
+    return RedirectResponse(url="/admin", status_code=303)
+
+
+@app.post("/admin/tag/add")
+async def admin_tag_add(
+    wallet: str = Form(...), tag: str = Form(...), label: str = Form(""), chain_id: str = Form(""),
+    astaroth_admin: Optional[str] = Cookie(default=None),
+):
+    if not _require_admin(astaroth_admin):
+        return RedirectResponse(url="/admin", status_code=303)
+    # [v4.52] Normalize the same way the trade-capture paths do — an EVM
+    # address pasted with any casing (or copied straight from a block
+    # explorer, which mixed-cases via EIP-55 checksum) has to be lowercased
+    # here too, or it will simply never match a captured trade's wallet.
+    # Solana base58 addresses are case-sensitive and must NOT be touched.
+    w = wallet.strip()
+    if w.startswith("0x") or w.startswith("0X"):
+        w = w.lower()
+    ok = await alert_db.add_wallet_tag_async(w, tag.strip().lower(), label, chain_id)
+    if ok:
+        logger.info(f"👑 Admin tagged wallet {w[:10]}... as {tag}")
+    return RedirectResponse(url="/admin", status_code=303)
+
+
+@app.post("/admin/tag/remove")
+async def admin_tag_remove(wallet: str = Form(...), astaroth_admin: Optional[str] = Cookie(default=None)):
+    if not _require_admin(astaroth_admin):
+        return RedirectResponse(url="/admin", status_code=303)
+    await alert_db.remove_wallet_tag_async(wallet.strip())
     return RedirectResponse(url="/admin", status_code=303)
 
 

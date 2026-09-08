@@ -86,6 +86,25 @@ CREATE TABLE IF NOT EXISTS subscribers (
     decided_at        REAL
 );
 CREATE INDEX IF NOT EXISTS idx_subscribers_status ON subscribers(status);
+
+-- [v4.52] Admin-curated wallet tags for the alert card's Insiders/KOLs line.
+-- There is no third-party wallet-intelligence feed wired in here (that's a
+-- paid-service category, not something free public APIs expose) -- this is
+-- a manually maintained list the admin builds up over time via the admin
+-- panel. Counts on any given alert will only be as complete as this table,
+-- and start at zero on a fresh deploy. `wallet` is stored exactly as the
+-- rest of the codebase already normalizes addresses for that chain (Solana
+-- base58 as-is/case-sensitive, EVM lowercase-hex) so a plain equality
+-- lookup works with no per-query normalization.
+CREATE TABLE IF NOT EXISTS wallet_tags (
+    id            INTEGER PRIMARY KEY AUTOINCREMENT,
+    wallet        TEXT NOT NULL UNIQUE,
+    tag           TEXT NOT NULL,   -- 'kol' | 'insider'
+    label         TEXT,            -- optional human-readable note (e.g. a KOL's handle)
+    chain_id      TEXT,            -- optional; empty/NULL = applies on any chain
+    added_at      REAL NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_wallet_tags_wallet ON wallet_tags(wallet);
 """
 
 
@@ -391,4 +410,118 @@ async def count_subscribers_async() -> Dict[str, int]:
         return await asyncio.to_thread(_count_subscribers)
     except Exception as e:
         logger.debug(f"Subscriber count failed: {e}")
+        return {}
+
+
+# ============================================================================
+# [v4.52] KOL / insider wallet tags — admin-curated, used by the alert card's
+# Insiders/KOLs count and by the top-traders table's labeling.
+# ============================================================================
+
+def _add_wallet_tag(wallet: str, tag: str, label: str, chain_id: str) -> bool:
+    conn = sqlite3.connect(_db_path, timeout=5)
+    try:
+        conn.execute(
+            "INSERT INTO wallet_tags (wallet, tag, label, chain_id, added_at) VALUES (?, ?, ?, ?, ?) "
+            "ON CONFLICT(wallet) DO UPDATE SET tag=excluded.tag, label=excluded.label, "
+            "chain_id=excluded.chain_id, added_at=excluded.added_at",
+            (wallet, tag, label or None, chain_id or None, time.time()),
+        )
+        conn.commit()
+        return True
+    finally:
+        conn.close()
+
+
+async def add_wallet_tag_async(wallet: str, tag: str, label: str = "", chain_id: str = "") -> bool:
+    """tag must be 'kol' or 'insider'. Re-tagging an existing wallet overwrites
+    its tag/label (upsert) rather than erroring, so an admin fixing a typo
+    doesn't need to delete-then-recreate. Never raises."""
+    if not _enabled or not wallet or tag not in ("kol", "insider"):
+        return False
+    try:
+        return await asyncio.to_thread(_add_wallet_tag, wallet.strip(), tag, label.strip(), chain_id.strip())
+    except Exception as e:
+        logger.warning(f"Wallet tag add failed: {e}")
+        return False
+
+
+def _remove_wallet_tag(wallet: str) -> bool:
+    conn = sqlite3.connect(_db_path, timeout=5)
+    try:
+        conn.execute("DELETE FROM wallet_tags WHERE wallet = ?", (wallet,))
+        conn.commit()
+        return True
+    finally:
+        conn.close()
+
+
+async def remove_wallet_tag_async(wallet: str) -> bool:
+    if not _enabled or not wallet:
+        return False
+    try:
+        return await asyncio.to_thread(_remove_wallet_tag, wallet)
+    except Exception as e:
+        logger.warning(f"Wallet tag remove failed: {e}")
+        return False
+
+
+def _list_wallet_tags() -> List[Dict]:
+    conn = sqlite3.connect(_db_path, timeout=5)
+    conn.row_factory = sqlite3.Row
+    try:
+        cur = conn.execute("SELECT * FROM wallet_tags ORDER BY added_at DESC")
+        return [dict(r) for r in cur.fetchall()]
+    finally:
+        conn.close()
+
+
+async def list_wallet_tags_async() -> List[Dict]:
+    if not _enabled:
+        return []
+    try:
+        return await asyncio.to_thread(_list_wallet_tags)
+    except Exception as e:
+        logger.debug(f"Wallet tag list failed: {e}")
+        return []
+
+
+def _get_wallet_tags_map(wallets: List[str]) -> Dict[str, Dict]:
+    if not wallets:
+        return {}
+    conn = sqlite3.connect(_db_path, timeout=5)
+    conn.row_factory = sqlite3.Row
+    try:
+        # Chunk to stay well under SQLite's default 999-variable limit —
+        # a single alert's unique-buyer set is never remotely this large,
+        # but this keeps the query safe regardless.
+        out: Dict[str, Dict] = {}
+        chunk_size = 400
+        for i in range(0, len(wallets), chunk_size):
+            chunk = wallets[i:i + chunk_size]
+            placeholders = ",".join("?" for _ in chunk)
+            cur = conn.execute(
+                f"SELECT wallet, tag, label FROM wallet_tags WHERE wallet IN ({placeholders})",
+                chunk,
+            )
+            for r in cur.fetchall():
+                out[r["wallet"]] = {"tag": r["tag"], "label": r["label"]}
+        return out
+    finally:
+        conn.close()
+
+
+async def get_wallet_tags_map_async(wallets: List[str]) -> Dict[str, Dict]:
+    """Looks up tags for a batch of wallet addresses at once (one query per
+    alert, not one per wallet). Returns {wallet: {"tag":..., "label":...}}
+    for whichever of the given wallets are actually tagged — untagged
+    wallets are simply absent from the result. Fails to an empty dict on
+    any error, which just means the alert's Insiders/KOLs line shows 0/0
+    (never blocks or delays the alert itself)."""
+    if not _enabled or not wallets:
+        return {}
+    try:
+        return await asyncio.to_thread(_get_wallet_tags_map, list(set(wallets)))
+    except Exception as e:
+        logger.debug(f"Wallet tag lookup failed: {e}")
         return {}
