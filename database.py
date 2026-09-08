@@ -235,17 +235,24 @@ async def get_stats_async() -> Dict:
 # [v4.50] Subscriber access control (admin-approved alert fan-out)
 # ============================================================================
 
-def _request_subscriber(user_id: str, chat_id: str, username: str, first_name: str) -> str:
+def _request_subscriber(user_id: str, chat_id: str, username: str, first_name: str,
+                         auto_approve: bool = False) -> str:
     """
     Registers (or looks up) a /start request. Returns one of:
       "new_pending"       — first time seeing this user, row created as pending
+      "new_approved"      — [v4.53] first time seeing this user, auto_approve
+                             was on, row created straight to approved —
+                             they'll receive alerts starting with the very
+                             next one fired, no admin click needed
       "already_pending"   — they already have an open request
       "already_approved"  — they're already an approved subscriber
       "already_revoked"   — an admin previously revoked them; does NOT
-                             resurrect the row to pending (a revoked user
-                             re-messaging /start should not silently get a
-                             second chance at approval without the admin
-                             deciding again on purpose via the panel)
+                             resurrect the row to pending/approved (a
+                             revoked user re-messaging /start — even with
+                             auto_approve on — should not silently get back
+                             in without the admin deciding again on purpose
+                             via the panel; auto-approve is for NEW
+                             requests, it doesn't undo a revoke)
     Never raises -- caller treats any DB failure as "new_pending" being
     unavailable and should fail safe (not send alerts).
     """
@@ -265,10 +272,19 @@ def _request_subscriber(user_id: str, chat_id: str, username: str, first_name: s
             )
             conn.commit()
             return f"already_{row['status']}"
+        now = time.time()
+        if auto_approve:
+            conn.execute(
+                "INSERT INTO subscribers (telegram_user_id, telegram_chat_id, username, "
+                "first_name, status, requested_at, decided_at) VALUES (?, ?, ?, ?, 'approved', ?, ?)",
+                (user_id, chat_id, username, first_name, now, now),
+            )
+            conn.commit()
+            return "new_approved"
         conn.execute(
             "INSERT INTO subscribers (telegram_user_id, telegram_chat_id, username, "
             "first_name, status, requested_at) VALUES (?, ?, ?, ?, 'pending', ?)",
-            (user_id, chat_id, username, first_name, time.time()),
+            (user_id, chat_id, username, first_name, now),
         )
         conn.commit()
         return "new_pending"
@@ -276,11 +292,12 @@ def _request_subscriber(user_id: str, chat_id: str, username: str, first_name: s
         conn.close()
 
 
-async def request_subscriber_async(user_id: str, chat_id: str, username: str, first_name: str) -> str:
+async def request_subscriber_async(user_id: str, chat_id: str, username: str, first_name: str,
+                                    auto_approve: bool = False) -> str:
     if not _enabled:
         return "unavailable"
     try:
-        return await asyncio.to_thread(_request_subscriber, user_id, chat_id, username, first_name)
+        return await asyncio.to_thread(_request_subscriber, user_id, chat_id, username, first_name, auto_approve)
     except Exception as e:
         logger.warning(f"Subscriber request failed: {e}")
         return "unavailable"

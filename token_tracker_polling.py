@@ -113,6 +113,19 @@ ADMIN_CHAT_ID = str(TELEGRAM_CHAT_ID).strip()
 ADMIN_PASSWORD = os.getenv("ADMIN_PASSWORD", "").strip()
 ADMIN_SESSION_SECRET = os.getenv("ADMIN_SESSION_SECRET", "").strip() or secrets.token_hex(32)
 ADMIN_SESSION_MAX_AGE = 7 * 24 * 3600  # 7 days
+# [v4.53] Per user request: open the bot up to everyone instead of gating
+# every new subscriber behind a manual admin click. Default true. A /start
+# from a brand-new user is approved immediately (see database._request_subscriber's
+# auto_approve path) instead of landing in "pending" — they start receiving
+# alerts on the very next one fired. The admin panel still exists and still
+# matters here: it's now the tool for REVOKING a spammy/abusive user rather
+# than for approving new ones. Set to "false" to go back to manual
+# admin-approval-required (no code change needed, just this env var).
+# Note this doesn't change HOW alerts are delivered (still one DM per
+# subscriber, sequentially staggered — see _fanout_alert_to_subscribers) —
+# at real scale that's a different, larger change (a public channel instead
+# of per-user DMs), not what was asked for here.
+AUTO_APPROVE_SUBSCRIBERS = os.getenv("AUTO_APPROVE_SUBSCRIBERS", "true").strip().lower() == "true"
 HELIUS_API_KEY = config.api.helius_api_key
 HELIUS_RPC = f"https://mainnet.helius-rpc.com/?api-key={HELIUS_API_KEY}" if HELIUS_API_KEY else ""
 
@@ -1647,7 +1660,7 @@ async def init_telegram():
         me = await telegram_bot.get_me()
         logger.info(f"✅ Telegram bot: {me.username}")
         commands = [
-            BotCommand("start", "Request alert access"),
+            BotCommand("start", "Get alert access"),
             BotCommand("status", "Bot status"),
             BotCommand("tokens", "All tracked tokens"),
             BotCommand("gems", "Alerted gems sorted by MC"),
@@ -1726,7 +1739,7 @@ async def _fanout_alert_to_subscribers(text: str) -> None:
 
 
 HELP_TEXT = (
-    "🤖 <b>ASTAROTH v4.11 Commands</b>\n\n"
+    "🤖 <b>ASTAROTH v4.53 Commands</b>\n\n"
     "/status — bot health + WS stats\n"
     "/gems — alerted gems sorted by MC\n"
     "/hot — high velocity tokens\n"
@@ -1935,15 +1948,29 @@ async def handle_telegram_command(text: str, chat_id=None, user: Optional[dict] 
         uid = str((user or {}).get("id", chat_id))
         uname = (user or {}).get("username") or ""
         fname = (user or {}).get("first_name") or ""
-        result = await alert_db.request_subscriber_async(uid, str(chat_id), uname, fname)
-        if result == "new_pending":
+        result = await alert_db.request_subscriber_async(
+            uid, str(chat_id), uname, fname, auto_approve=AUTO_APPROVE_SUBSCRIBERS
+        )
+        who = f"@{uname}" if uname else (fname or uid)
+        if result == "new_approved":
+            # [v4.53] Open-access path — no admin click needed.
+            await reply(
+                "✅ <b>You're in!</b>\n\n"
+                "You'll now receive ASTAROTH's live gem alerts here. "
+                "Check /myaccess any time, or /help for the full command list."
+            )
+            await send_telegram_now(
+                f"➕ <b>New subscriber</b>\n{who} (id {uid}) joined (auto-approved).\n"
+                "Manage subscribers any time in the admin panel (/admin).",
+                chat_id=ADMIN_CHAT_ID,
+            )
+        elif result == "new_pending":
             await reply(
                 "👋 <b>Access request sent.</b>\n\n"
                 "ASTAROTH's live gem alerts are admin-approved. Your request "
                 "has been logged — you'll get a message here the moment "
                 "you're approved. Check /myaccess any time."
             )
-            who = f"@{uname}" if uname else (fname or uid)
             await send_telegram_now(
                 f"🔔 <b>New access request</b>\n{who} (id {uid}) wants alert access.\n"
                 "Review it in the admin panel (/admin) to approve or deny.",
